@@ -703,7 +703,7 @@ if __name__ == "__main__":
 				with tf.GradientTape() as tape:
 					output, _ = model(input)
 					loss_value = loss_function(y_pred = output, y_true = targets)
-					loss_value += sum(model.losses) # tf.nn.scale_regularization_loss(sum(model.losses))	
+					loss_value += tf.nn.scale_regularization_loss(sum(model.losses))	
 					
 				grads = tape.gradient(loss_value, model.trainable_variables)
 				optimizer.apply_gradients(zip(grads, model.trainable_variables),experimental_aggregate_gradients=False )

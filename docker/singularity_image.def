@@ -1,0 +1,21 @@
+Bootstrap: docker
+
+From: nvcr.io/nvidia/tensorflow:21.08-tf2-py3
+
+
+%post
+    pip install --upgrade pip
+    pip install docopt
+    pip install grpcio
+    pip install numpy
+    pip install sklearn
+    pip install matplotlib
+    pip install --upgrade tensorflow==2.7
+    pip install seaborn
+    pip install scipy
+    pip install numba
+    pip install pandas
+    pip install pandas-plink
+    pip install pyarrow
+    pip install dask
+    pip install pysnptools
