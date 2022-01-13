@@ -17,8 +17,12 @@ from sklearn.metrics import f1_score
 from scipy import stats
 from pandas_plink import read_plink
 import csv
-
-
+import pyarrow.parquet as pq
+import pandas as pd
+from sklearn.preprocessing import  StandardScaler
+from pysnptools.snpreader import Bed
+import pyarrow as pa
+import shutil
 
 class data_generator_ae:
 	'''
@@ -182,6 +186,32 @@ class data_generator_ae:
 		self.n_train_samples = len(self.sample_idx_train)
 
 
+	def define_validation_set2(self, validation_split):
+		'''
+		Define a set of validation samples from original train samples.
+		Stratified by population.
+
+		Re-defines self.sample_idx_train and self.sample_idx_valid
+
+		:param validation_split: proportion of samples to reserve for validation set
+
+		If validation_split is less samples than there are populations, one sample per population is returned.
+		'''
+
+
+		# reset index of fetching train batch samples
+		self.train_batch_location = 0
+
+		self.sample_idx_train, self.sample_idx_valid = get_test_samples_stratified2(self.ind_pop_list_train_orig, validation_split)
+
+		self.sample_idx_train = np.array(self.sample_idx_train)
+		self.sample_idx_valid = np.array(self.sample_idx_valid)
+
+		self.train_set_indices = np.array(range(len(self.sample_idx_train)))
+		self.n_valid_samples = len(self.sample_idx_valid)
+		self.n_train_samples = len(self.sample_idx_train)
+
+
 	def get_valid_set(self, sparsify):
 		'''
 
@@ -268,7 +298,7 @@ class data_generator_ae:
 
 		:param sparsify:
 		:param n_samples_batch: number of samples in batch
-		:return: input_data_train_batch (n_samples x n_markers x 2): sparsified  genotypes with mask specifying missing values of trai batch.
+		:return: input_data_train_batch (n_samples x n_markers x 2): sparsified  genotypes with mask specifying missing values of train batch.
 																			   originally missing + removed by sparsify are indicated by value 0
 				 target_data_train_batch (n_samples x n_markers): original genotypes of this train batch
 				 ind_pop_list_train_batch (n_samples x 2) : individual and population IDs of train batch samples
@@ -937,6 +967,82 @@ def get_test_samples_stratified(genotypes, ind_pop_list, test_split):
 
 		# If we only have one sample with "Other": randomly select another one so its at least 2 per pop.
 		if len(np.where(pop_list == "Other")[0]) == 1:
+			r = np.random.choice(range(n_samples))
+			while r in np.where(pop_list == "Other")[0]:
+				r = np.random.choice(range(n_samples))
+			pop_list[r] = "Other"
+
+
+	################################################################################################
+		panel_pops = np.unique(pop_list)
+		n_pops = len(panel_pops)
+
+		if np.ceil(test_split * n_samples) < n_pops:
+			test_split = float(n_pops) / n_samples
+			print(str(test_split * n_samples) + "{0} is too few samples for " + str(n_pops) +" classes. Setting split fraction to " + str(test_split))
+
+
+		sample_idx = range(len(genotypes))
+		genotypes_train, genotypes_test, sample_idx_train, sample_idx_test, pops_train, pops_test = train_test_split(genotypes, sample_idx, pop_list, test_size=test_split, stratify=pop_list, random_state = 0)
+		sample_idx_train = np.array(sample_idx_train)
+		sample_idx_test = np.array(sample_idx_test)
+
+		pops_train_recon = pop_list[sample_idx_train]
+		pops_test_recon = pop_list[sample_idx_test]
+
+		for i in range(len(pops_train_recon)):
+			assert pops_train_recon[i] == pops_train[i]
+		for i in range(len(pops_test_recon)):
+			assert pops_test_recon[i] == pops_test[i]
+
+		return genotypes_train, genotypes_test, sample_idx_train, sample_idx_test
+
+
+
+
+def get_test_samples_stratified2(ind_pop_list, test_split):
+	'''
+	Generate a set of samples stratified by population from eigenstratgeno data.
+	FILIP EDIT: REMOVED THE GENOTYPE INPUT/OUTPUT- CANT FIND THE UISE OF IT. ONLY INDICES ARE OF INTEREST
+	Samples from populations with only one sample are considered as belonging to the same temporary population,
+	and stratified according to that. If there is only one such sample, another one is randomly assigned the
+	temporary population.
+
+	:param genotypes: (n_samples x n_markers) array of genotypes
+	:param ind_pop_list: (n_smaples x 2) list of individual id and population of all samples
+	:param test_split: fraction of samples to include in test set
+	:return: genotypes_train (n_train_samples x n_markers): genotypes of train samples
+			 genotypes_test (n_test_samples x n_markers): genotypes of test samples
+			 sample_idx_train (n_train_samples): indices of train samples in original data
+			 sample_idx_test (n_test_samples): indices of test samples in original data
+
+
+	If test_split is 0.0, genotypes_test and sample_idx_test are [].
+	'''
+	pop_list = np.array(ind_pop_list[:,1])
+	panel_pops = np.unique(pop_list)
+	n_samples = len(pop_list)
+
+
+	if test_split == 0.0:
+		return  range(len(ind_pop_list)), []
+
+	################### stratify cant handle classes with only one sample ########################
+
+	else:
+		counter_dict = {}
+		for pop in panel_pops:
+			counter_dict[pop] = 0
+
+		for ind,pop in ind_pop_list:
+			counter_dict[pop] += 1
+
+		for pop in counter_dict.keys():
+			if counter_dict[pop] == 1:
+				np.place(pop_list, pop_list == pop, ["Other"])
+
+		# If we only have one sample with "Other": randomly select another one so its at least 2 per pop.
+		if len(np.where(pop_list == "Other")[0]) == 1:
 			r = random.choice(range(n_samples))
 			while r in np.where(pop_list == "Other")[0]:
 				r = random.choice(range(n_samples))
@@ -952,8 +1058,8 @@ def get_test_samples_stratified(genotypes, ind_pop_list, test_split):
 			print(str(test_split * n_samples) + "{0} is too few samples for " + str(n_pops) +" classes. Setting split fraction to " + str(test_split))
 
 
-		sample_idx = range(len(genotypes))
-		genotypes_train, genotypes_test, sample_idx_train, sample_idx_test, pops_train, pops_test = train_test_split(genotypes, sample_idx, pop_list, test_size=test_split, stratify=pop_list)
+		sample_idx = range(len(pop_list))
+		sample_idx_train, sample_idx_test, pops_train, pops_test = train_test_split(sample_idx, pop_list, test_size=test_split, stratify=pop_list)
 		sample_idx_train = np.array(sample_idx_train)
 		sample_idx_test = np.array(sample_idx_test)
 
@@ -965,7 +1071,8 @@ def get_test_samples_stratified(genotypes, ind_pop_list, test_split):
 		for i in range(len(pops_test_recon)):
 			assert pops_test_recon[i] == pops_test[i]
 
-		return genotypes_train, genotypes_test, sample_idx_train, sample_idx_test
+		return sample_idx_train, sample_idx_test
+
 
 
 def get_most_frequent(data):
@@ -980,3 +1087,359 @@ def get_most_frequent(data):
 	modes = stats.mode(data)
 	most_common_feature = modes.mode
 	return most_common_feature[0]
+
+
+
+class alt_data_generator(data_generator_ae):
+
+	def __init__(self, filebase,
+		 		 batch_size, normalization_mode = "genotypewise01",
+		  		normalization_options ={"flip": False, "missing_val":-1.0}, impute_missing = True, sparsifies = [0] ):
+
+		self.filebase = filebase 
+		self.batch_size = batch_size
+		self._define_samples()
+		self.normalization_mode = normalization_mode
+		self.normalization_options = normalization_options
+		self.impute_missing = impute_missing
+		self.sparsifies = sparsifies
+		self.missing_val = normalization_options["missing_val"]
+
+		self.marker_count() # This sets the number of markers
+
+		if len(sparsifies) == 0:
+			self.sparsify_input = False
+		else:
+			self.sparsify_input = True
+
+
+	def generator(self, pref_chunk_size, training, shuffle = True):
+
+		"""
+			This function reads a chunk of data, which I define as an integer multiple of the batch size, into memory.
+			It defines a generator, that we can then feed into Tensorflow and create a dataset from it by calling
+			ds = tf.data.Dataset.from_generator("this_function").
+
+			This enables us to read large files, without dumping all the data to memory (I hope).
+			Also, since the data is huge, reading the whole dataset takes a lot of time.
+			This way, we can start training earlier, not having to wait for all samples to be loaded in before training.
+			Using the TensorFlow data API, we can then effectively prefetch, and apply the normalization and sparsification
+			as maps, which can be computed in parallel.
+
+			There may of course be stuff I have done incorrectly, or understood wrongly.
+
+			As of right now, I am using .parquet files. This may not be optimal, but the format is very efficient at loading selected columns (samples)
+			from the data set, and does not have to go through all the samples.
+
+			param: training, if True, draw training samples, if False, draw the valdiation points
+
+		"""
+
+		if training:
+			training = True
+			n_samples = self.n_train_samples
+			# This yields randomized chunks and batches for each epoch. Essentially shuffling the samples
+			if shuffle:
+				indices = self.sample_idx_train[np.random.choice(n_samples, n_samples, replace=False)]
+			else:
+				indices = self.sample_idx_train[np.arange(0,n_samples)]
+				
+
+		elif not training:
+			training = False
+			n_samples = self.n_valid_samples
+			if shuffle:
+				indices = self.sample_idx_valid[np.random.choice(n_samples, n_samples, replace=False)]
+			else:
+				indices = self.sample_idx_valid[np.arange(0,n_samples)]
+			
+
+		chunk_size = pref_chunk_size // self.batch_size * self.batch_size # Make the preferred chunk size an integer multiple of the batch size
+		num_chunks = np.ceil(n_samples / chunk_size)
+		chunks_read = 0
+
+		while chunks_read < num_chunks:
+			chunk_indices = indices[chunk_size * chunks_read: chunk_size * (chunks_read + 1)]
+			chunk_inds = ["".join(item) for item in chunk_indices.astype(str)] # The indices needs to be given as a list of strings for the parquet-file read.
+
+			df = pd.read_parquet(self.filebase + ".parquet", columns=chunk_inds) 
+			# Read only the selected indices into memory,
+			# this read is made to be as large as possible, consisting of several batches, but (perhaps not the entire dataset)
+
+			df_numpy = pd.DataFrame.to_numpy(df)
+
+			batches_per_chunk = np.ceil(len(chunk_indices) / self.batch_size)
+
+			batches_read = 0
+			while batches_read < batches_per_chunk:
+
+				genotypes_train = df_numpy[:, self.batch_size * batches_read: self.batch_size * (batches_read + 1)]
+
+				inds = chunk_indices[self.batch_size * batches_read: self.batch_size * (batches_read + 1)]
+
+				# If the shape does not match the usual batch size, i.e., we are on the last batch, also yield the keyword "last_batch" as a True bool. Need to explicitly give this since
+				# Tensorflow does not know the actual batch size at run time, and I need to create the mask not having access to .shape commands at run time.
+				
+				if genotypes_train.shape[1] == self.batch_size:
+					yield genotypes_train, self.ind_pop_list_train_orig[inds], [False, training]
+				else:
+					yield genotypes_train, self.ind_pop_list_train_orig[inds], [True,  training]
+
+				batches_read += 1
+			chunks_read += 1
+			
+	def normalize_mapping(self, x, inds, args):
+		"""
+			The purpose of this function is to use as mapping onto a dataset.
+			It returns the data normalized, and transposes the matrix into the desired shape of (n_samples, n_markers).
+			The specific normalization is to be specified in the run_gcae - call.
+
+			The args input is a list of [last_batch, training] both bools, indicating whether or the current batch is the last one (with different size)
+			and if it is the training set or vcalidation set.
+		"""
+		last_batch = args[0]
+		training = args[1]
+		missing_indices = tf.where(tf.transpose(x) == 9)
+		
+		if last_batch == False:
+
+			num_samples = self.batch_size
+		else:
+		
+			if training : num_samples = self.n_train_samples_last_batch
+			else : num_samples = self.n_valid_samples_last_batch
+	
+		# a is a sparse tensor containing the missing values.
+		a = tf.sparse.SparseTensor(indices=missing_indices,
+								values=tf.ones(shape=tf.shape(missing_indices)[0], dtype=tf.float32),
+								dense_shape=(num_samples, self.n_markers))
+
+		indices = missing_indices[:,1]
+		x  = tf.transpose(x)
+		if self.impute_missing: 
+			b = tf.sparse.SparseTensor(indices=missing_indices,
+										values=(tf.gather(self.most_common_genos,indices = indices) -9),
+										dense_shape=(num_samples, self.n_markers))
+			x = tf.sparse.add(x,b)
+			
+		if self.normalization_mode == "genotypewise01":
+			if self.normalization_options["flip"]:
+				# This operation results in the missing values having a value of -7/2, wrong! Amend this by adding 3.5-missing_val
+				x = -(x - 2) / 2
+				if not self.impute_missing:
+					x = tf.sparse.add(x,a * (3.5 - self.missing_val))
+			else:
+				# This operation results in the missing values having a value of 4.5, wrong! Amend this by subtracting 4.5-missing_val
+				x = x / 2
+				if not self.impute_missing:
+					x = tf.sparse.add(x, a  * ( self.missing_val - 4.5))
+
+		elif self.normalization_mode == "standard" or self.normalization_mode == "smartPCAstyle":
+			if self.normalization_options["flip"]:
+				x = -(x - 2)
+			x2 = (x - self.scaler.mean_) / np.sqrt(self.scaler.var_)
+			if not self.impute_missing:
+				x = tf.sparse.add(x2, a.__mul__(self.missing_val - x2))
+				
+		return x, inds, last_batch
+
+	def sparse_mapping(self, x, inds, last_batch):
+		"""
+		I am having a hard time getting the shapes correct for the case with no sparsification.
+		It says that it expects [batch_size, n_markers, 1], but receives [batch_size, n_markers]. I have not yet come up with a solution for this.
+		In the meantime, if we want to run with no sparsification, just set sparsifies = [0] in the data_ops files.
+
+		"""
+		if self.sparsify_input and self.training:
+			# Not 100% straight forward how to get the same 'rolling sparsification' that the sparsify fraction uses the next value for the next batch.
+			# Here I am just choosing one of the fractions at random. Should have essentially the same effect if I am not missing anything.
+			# Makes it hard to compare the runs for the original code vs my alteration. 
+			sparsify_fraction = self.sparsifies[np.random.choice(len(self.sparsifies))]
+
+		else:
+			sparsify_fraction = 0.0
+		try:
+			if self.project:
+				sparsify_fraction = 0.0
+		except:
+			pass
+
+		missing_value = self.missing_val
+		keep_fraction = 1.0 - sparsify_fraction
+
+		if last_batch:
+			if self.training:
+				mask = np.full(shape=(self.n_train_samples_last_batch, self.n_markers), fill_value=1.0,
+								dtype=np.float32)
+				mask[np.random.random_sample((self.n_train_samples_last_batch, self.n_markers)) > keep_fraction] = 0.0
+			else:
+				mask = np.full(shape=(self.n_valid_samples_last_batch, self.n_markers), fill_value=1.0,
+								dtype=np.float32)
+				mask[np.random.random_sample((self.n_valid_samples_last_batch, self.n_markers)) > keep_fraction] = 0.0
+		else:
+			mask = np.full(shape=(self.batch_size, self.n_markers), fill_value=1.0, dtype=np.float32)
+			mask[np.random.random_sample((self.batch_size, self.n_markers)) > keep_fraction] = 0.0
+
+
+		sparsified_data = tf.math.add(tf.math.multiply(x, mask), -1 * missing_value * (mask - 1))
+		input_data_train = tf.stack([sparsified_data, mask], axis=-1)
+
+		if self.missing_mask_input:
+			return input_data_train, x, inds
+
+		else:
+			# Just extract everything but the last dimension, which contains the mask.
+			return input_data_train[:, :, 0], x, inds
+
+
+	
+	def marker_count(self):
+		"""
+		Just a funtion to count the number of markers.
+		Reads only one column, does not have to read entire dataset
+		"""
+		df = pd.read_parquet(self.filebase+".parquet", columns=["0"])
+		self.n_markers = len(df.to_numpy())
+
+	def prep_normalizer(self, ds):
+		# TODO- Fix so that the normalizer is calibrated with more samples than it is trained with. In this case, if very few samples are used, there may be some issues if all have missing data at the same marker position
+		temp = np.zeros((self.n_markers,3))
+
+		print("Calibrating data scaler for normalization, remember to fix this. In prep_normalizer. Note in the function def.")
+		if self.normalization_mode == "standard" or self.normalization_mode == "smartPCAstyle" or self.impute_missing == True:
+			self.scaler = StandardScaler()
+
+			for i, j, _ in ds:
+				a = np.zeros(shape=i.shape)
+				a[i == 9] = np.nan
+
+				if self.normalization_options["flip"]:
+					i = -(i - 2)  # This sends 1 to 1, 0 to 2, and 2 to 0
+				self.scaler.partial_fit(tf.transpose(a + i))
+				
+
+				for k in range(3):
+
+					temp[:,k] += tf.reduce_sum(tf.cast(i == k, tf.int32),axis = 1) 
+			
+
+			self.most_common_genos = tf.cast(tf.transpose(np.argmax(temp, axis = 1)),tf.float32)
+
+			if self.normalization_mode == "smartPCAstyle":
+				p = (1 + self.scaler.mean_ * self.scaler.n_samples_seen_) / (2 + 2 * self.scaler.n_samples_seen_)
+
+				self.scaler.var_ = p * (1 - p)
+
+	
+	def create_dataset(self,pref_chunk_size, mode, shuffle = True):
+		if mode ==  "training":
+			self.training = True
+		elif mode == "validation":
+			self.training = False
+		else:
+			print("pass either training or validation")
+			return -1
+
+		ds = tf.data.Dataset.from_generator(self.generator,
+											output_signature=(tf.TensorSpec(shape=(self.n_markers, None), dtype=tf.float32),
+																tf.TensorSpec(shape=(None, 2), dtype=tf.string),
+																tf.TensorSpec(shape=(2,), dtype=tf.bool)),
+											args=[pref_chunk_size, self.training, shuffle])
+		if mode == "training":
+			self.prep_normalizer(ds)  # This generates the needed scalers for normalization´using standard and smartPCAstyle
+		options = tf.data.Options()
+		
+		options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+		ds  = ds.with_options(options)
+	
+
+		ds = ds.prefetch(tf.data.AUTOTUNE).map(self.normalize_mapping, num_parallel_calls=tf.data.AUTOTUNE)
+		ds = ds.map(self.sparse_mapping, num_parallel_calls=tf.data.AUTOTUNE)
+	
+		
+		return ds
+
+
+def parquet_converter(filebase, max_mem_size):
+	"""
+
+	This function is made so that we can use .parquet files in the input pipeline, without having the user make sure that the correct fileformat exists.
+
+	I have also attempted to make sure that the function can convert datasets that are too large to fit in memory in its entirety.
+	The parameter max_mem_size regulates how many large chunks we can read and write at a time. It is to be given in Bytes,
+	so say that we want to set a cap at 10GB set max_mem_size to 10^10.
+	
+	I think it is good to take as large a max_mem_size as possible, to achieve maximal compression in the resulting combined parquet file
+
+	Right now I am only supporting the input as a PLINK format. The eigenstratgeno is very slow to load, and can really only load entire dataset I think.
+
+
+	"""
+
+	# First, check if there already exists a correct parquet file, if it does just return without doing anything
+
+	if os.path.isfile(filebase + ".parquet"):
+		print("Not creating parquet file: Already exists.")
+		return
+	
+	print("Creating .parquet file from PLINK for faster data extraction. This may take a while")
+
+	snpreader = Bed(filebase + ".bed", count_A1=True)
+	# Step 1, partition the dataset indices according to the maximum readable amount
+	# The shape of the .bed files are given as (n_samples x n_markers), read as dtype = float32 = 8 Bytes
+	
+	(n_samples, n_markers) = snpreader.shape
+	
+	n_samples_in_chunk = np.floor(max_mem_size / 8.0 / n_samples)
+
+	n_chunks = np.ceil(n_markers / n_samples_in_chunk)
+
+	# Step 2, While looping over the chunks of indices, read the data into numpy arrays
+
+	if not os.path.isdir("Data_temp"):
+		os.mkdir("Data_temp")
+
+	for i in range(int(n_chunks)):
+		a = snpreader[:, int(n_samples_in_chunk * i):int(n_samples_in_chunk * (i + 1))].read().val
+
+		# Step 3, Save each ndarray into .parquet file
+		df = pd.DataFrame(a.T)
+		table = pa.Table.from_pandas(df)
+		it_number = 8 - len(str(i))
+		if n_chunks > 1:
+			pq.write_table(table, "Data_temp/temp" + it_number * "0" + str(i) + ".parquet")
+		else: 
+			pq.write_table(table, filebase+".parquet")
+
+	if n_chunks > 1:
+		# Step 4, Combine smaller files into 1 large parq
+		def combine_parquet_files(input_folder, target_path):
+			try:
+
+				file_name = os.listdir(input_folder)[0]
+				temp_data = pq.read_table(os.path.join(input_folder, file_name))
+
+				with pq.ParquetWriter(target_path,
+									temp_data.schema,
+									version='2.6',
+									compression='gzip',
+									use_dictionary=True,
+									data_page_size=2097152,  # 2MB
+									write_statistics=True) as writer:
+					for file_name in os.listdir(input_folder):
+						writer.write_table(pq.read_table(os.path.join(input_folder, file_name)))
+			except Exception as e:
+				print(e)
+
+		combine_parquet_files('Data_temp', 'Data/combined.parquet')
+
+	# step 5, delete any temp files
+	shutil.rmtree("Data_temp")
+
+
+
+
+
+
+
+
