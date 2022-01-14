@@ -131,7 +131,7 @@ class data_generator_ae:
 																					 get_scaler = True,
 																					 **self.normalization_options)
 		self.scaler = scaler
-
+		
 		self.genotypes_train_orig = np.array(genotypes_train_normed, dtype = np.dtype('f4'), order='C')
 
 	def get_nonnormalized_data(self):
@@ -1094,7 +1094,7 @@ class alt_data_generator(data_generator_ae):
 
 	def __init__(self, filebase,
 		 		 batch_size, normalization_mode = "genotypewise01",
-		  		normalization_options ={"flip": False, "missing_val":-1.0}, impute_missing = True, sparsifies = [0] ):
+		  		normalization_options ={"flip": False, "missing_val":-1.0}, impute_missing = True, sparsifies = False ):
 
 		self.filebase = filebase 
 		self.batch_size = batch_size
@@ -1107,7 +1107,7 @@ class alt_data_generator(data_generator_ae):
 
 		self.marker_count() # This sets the number of markers
 
-		if len(sparsifies) == 0:
+		if  sparsifies == False:
 			self.sparsify_input = False
 		else:
 			self.sparsify_input = True
@@ -1169,7 +1169,8 @@ class alt_data_generator(data_generator_ae):
 			df_numpy = pd.DataFrame.to_numpy(df)
 
 			batches_per_chunk = np.ceil(len(chunk_indices) / self.batch_size)
-
+			# Set nan values to 9. 
+			df_numpy[np.where(np.isnan(df_numpy))] = 9
 			batches_read = 0
 			while batches_read < batches_per_chunk:
 
@@ -1199,6 +1200,7 @@ class alt_data_generator(data_generator_ae):
 		"""
 		last_batch = args[0]
 		training = args[1]
+		# assuming the missing values are 9
 		missing_indices = tf.where(tf.transpose(x) == 9)
 		
 		if last_batch == False:
@@ -1282,6 +1284,7 @@ class alt_data_generator(data_generator_ae):
 
 
 		sparsified_data = tf.math.add(tf.math.multiply(x, mask), -1 * missing_value * (mask - 1))
+
 		input_data_train = tf.stack([sparsified_data, mask], axis=-1)
 
 		if self.missing_mask_input:
@@ -1330,7 +1333,7 @@ class alt_data_generator(data_generator_ae):
 
 				self.scaler.var_ = p * (1 - p)
 
-	
+
 	def create_dataset(self,pref_chunk_size, mode, shuffle = True):
 		if mode ==  "training":
 			self.training = True

@@ -555,6 +555,7 @@ if __name__ == "__main__":
 		sparsify_input = False
 		missing_mask_input = False
 		n_input_channels = 1
+		sparsifies = False
 
 	if "impute_missing" in data_opts.keys():
 		fill_missing = data_opts["impute_missing"]
@@ -580,11 +581,11 @@ if __name__ == "__main__":
 	data_prefix = datadir + pdata
 	results_directory = "{0}/{1}".format(train_directory, pdata)
 
-	if not os.path.exists(train_directory):
-			os.mkdir(train_directory)
-	if not os.path.exists(results_directory):
-		if isChief:
-			os.mkdir(results_directory)
+	#if not os.path.exists(train_directory):
+	#				os.mkdir(train_directory)
+	#if not os.path.exists(results_directory):
+	#	if isChief:
+	#		os.mkdir(results_directory)
 		
 	
 	encoded_data_file = "{0}/{1}/{2}".format(train_directory, pdata, "encoded_data.h5")
@@ -617,8 +618,7 @@ if __name__ == "__main__":
 		filebase = data_prefix
 		t3 = time.perf_counter()
 		parquet_converter(filebase, max_mem_size=max_mem_size)
-		print("time to create parquet")
-		print(time.perf_counter()- t3)
+		print("time for creating parquet: " + str(time.perf_counter()- t3))
 		data = alt_data_generator(filebase= data_prefix, 
 						batch_size = batch_size,
 						normalization_mode = norm_mode,
@@ -755,7 +755,8 @@ if __name__ == "__main__":
 						batch_size = batch_size,
 						normalization_mode = norm_mode,
 						normalization_options = norm_opts,
-						impute_missing = fill_missing)
+						impute_missing = fill_missing,
+						sparsifies  = sparsifies)
 
 		n_markers = data.n_markers
 		data.define_validation_set2(validation_split= 0.2)
@@ -815,7 +816,7 @@ if __name__ == "__main__":
 		chief_print("Model layers and dimensions:")
 		chief_print("-----------------------------")
 
-		chunk_size = 20 * data.batch_size
+		chunk_size = 5 * data.batch_size
 	
 
 		ds = data.create_dataset(chunk_size, "training")
@@ -829,8 +830,8 @@ if __name__ == "__main__":
 			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
 
 
-			batch_dist_input, batch_dist_target, _ = next(ds.as_numpy_iterator())
-			output_test, encoded_alt_data_generator = autoencoder(batch_dist_input, is_training = False, verbose = True)
+			#batch_dist_input, batch_dist_target, _ = next(ds.as_numpy_iterator())
+			#output_test, encoded_alt_data_generator = autoencoder(batch_dist_input, is_training = False, verbose = True)
 
 			if resume_from:
 				chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
@@ -883,7 +884,7 @@ if __name__ == "__main__":
 				t0 = time.perf_counter()
 				for batch_dist_input, batch_dist_target, _  in dds:
 					train_batch_loss += distributed_train_step(autoencoder, optimizer, loss_func, batch_dist_input, batch_dist_target)
-				
+			
 				train_loss_this_epoch = train_batch_loss /n_train_samples  
 		
 				with train_writer.as_default():
@@ -1037,7 +1038,7 @@ if __name__ == "__main__":
 		edgecolors_per_epoch = []
 
 		data.batch_size = batch_size_project 
-		chunk_size = 20  * data.batch_size
+		chunk_size = 5  * data.batch_size
 		
 		# HERE WE NEED TO "NOT SHUFFLE" THE DATASET, IN ORDER TO GET EVALUATE TO WORK AS INTENDED (otherwise, there is a problem with the ordering, works on its own, 
 		# but works differently when directly compared to original implementation) 
