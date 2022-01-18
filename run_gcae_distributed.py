@@ -581,11 +581,13 @@ if __name__ == "__main__":
 	data_prefix = datadir + pdata
 	results_directory = "{0}/{1}".format(train_directory, pdata)
 
-	#if not os.path.exists(train_directory):
-	#				os.mkdir(train_directory)
+	if not os.path.exists(train_directory):
+		if isChief:
+			#os.mkdir(trainedmodeldir)
+			os.mkdir(train_directory)
 	#if not os.path.exists(results_directory):
-	#	if isChief:
-	#		os.mkdir(results_directory)
+		#if isChief:
+			os.mkdir(results_directory)
 		
 	
 	encoded_data_file = "{0}/{1}/{2}".format(train_directory, pdata, "encoded_data.h5")
@@ -614,7 +616,7 @@ if __name__ == "__main__":
 
 		# Create parquet file from the plink files if it does not already exist, and create an instance of the dataset. 
 		# The number of SNP markers are needed in the loss function definitions
-		max_mem_size = 10**10
+		max_mem_size = 5 * 10**10 # this is approx 50GB
 		filebase = data_prefix
 		t3 = time.perf_counter()
 		parquet_converter(filebase, max_mem_size=max_mem_size)
@@ -661,7 +663,7 @@ if __name__ == "__main__":
 
 					per_example_loss = loss_obj(y_true, y_pred)
 					per_example_loss /= n_markers
-					loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=1
+					loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=batch_size
 														) 
 
 					return loss
@@ -694,7 +696,7 @@ if __name__ == "__main__":
 						loss_obj = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE) 
 					per_example_loss = loss_obj(y_true = y_true, y_pred = y_pred)			
 
-					loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size= 1 ) 
+					loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size= batch_size) 
 					return loss
 						
 			@tf.function
@@ -1087,7 +1089,7 @@ if __name__ == "__main__":
 			encoded_train = np.array(encoded_train)
 
 			
-			loss_value = np.sum(loss_value_per_train_batch)  / n_train_samples * batch_size  
+			loss_value = np.sum(loss_value_per_train_batch)  / n_train_samples  
 
 			if epoch == epochs[0]:
 				assert len(ind_pop_list_train) == data.n_train_samples, "{0} vs {1}".format(len(ind_pop_list_train), data.n_train_samples)
