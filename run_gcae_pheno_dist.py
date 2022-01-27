@@ -1,11 +1,11 @@
 """GenoCAE.
 
 Usage:
-  run_gcae_distributed.py train --datadir=<name> --data=<name> --model_id=<name> --train_opts_id=<name> --data_opts_id=<name> --save_interval=<num> --epochs=<num> [--resume_from=<num> --trainedmodeldir=<name> ]
-  run_gcae_distributed.py project --datadir=<name>   [ --data=<name> --model_id=<name>  --train_opts_id=<name> --data_opts_id=<name> --superpops=<name> --epoch=<num> --trainedmodeldir=<name>   --pdata=<name> --trainedmodelname=<name>]
-  run_gcae_distributed.py plot --datadir=<name> [  --data=<name>  --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name>  --pdata=<name> --trainedmodelname=<name>]
-  run_gcae_distributed.py animate --datadir=<name>   [ --data=<name>   --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name> --pdata=<name> --trainedmodelname=<name>]
-  run_gcae_distributed.py evaluate --datadir=<name> --metrics=<name>  [  --data=<name>  --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name>  --pdata=<name> --trainedmodelname=<name>]
+  run_gcae.py train --datadir=<name> --data=<name> --model_id=<name> --train_opts_id=<name> --data_opts_id=<name> --save_interval=<num> --epochs=<num> [--resume_from=<num> --trainedmodeldir=<name> ] [--pheno_model_id=<name>]
+  run_gcae.py project --datadir=<name>   [ --data=<name> --model_id=<name>  --train_opts_id=<name> --data_opts_id=<name> --superpops=<name> --epoch=<num> --trainedmodeldir=<name>   --pdata=<name> --trainedmodelname=<name>]
+  run_gcae.py plot --datadir=<name> [  --data=<name>  --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name>  --pdata=<name> --trainedmodelname=<name>]
+  run_gcae.py animate --datadir=<name>   [ --data=<name>   --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name> --pdata=<name> --trainedmodelname=<name>]
+  run_gcae.py evaluate --datadir=<name> --metrics=<name>  [  --data=<name>  --model_id=<name> --train_opts_id=<name> --data_opts_id=<name>  --superpops=<name> --epoch=<num> --trainedmodeldir=<name>  --pdata=<name> --trainedmodelname=<name>]
 
 Options:
   -h --help             show this screen
@@ -27,15 +27,11 @@ Options:
 
 """
 
-from numpy.random import seed
-seed(1)
-from tensorflow.random import set_seed
-set_seed(2)
 from docopt import docopt, DocoptExit
 import tensorflow as tf
 from tensorflow.keras import Model, layers
 from datetime import datetime
-from utils.data_handler import  get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv, alt_data_generator, parquet_converter
+from utils.data_handler import  get_saved_epochs, get_projected_epochs, write_h5, read_h5, get_coords_by_pop, data_generator_ae, convex_hull_error, f1_score_kNN, plot_genotype_hist, to_genotypes_sigmoid_round, to_genotypes_invscale_round, GenotypeConcordance, get_pops_with_k, get_ind_pop_list_from_map, get_baseline_gc, write_metric_per_epoch_to_csv
 from utils.visualization import plot_coords_by_superpop, plot_clusters_by_superpop, plot_coords, plot_coords_by_pop, make_animation, write_f1_scores_to_csv
 import utils.visualization
 import utils.layers
@@ -49,14 +45,45 @@ import csv
 import copy
 import h5py
 import matplotlib.animation as animation
+import asyncio
 from pathlib import Path
+from utils.data_handler import alt_data_generator, parquet_converter
 from utils.set_tf_config_berzelius import set_tf_config
-from utils.data_handler import alt_data_generator
 
+#gpus = tf.config.experimental.list_physical_devices('GPU')
+#tf.config.experimental.set_virtual_device_configuration(gpus[0], [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=28000)])
+
+#mirrored_strategy = tf.distribute.MirroredStrategy()
+#tf.debugging.enable_check_numerics()
+
+
+
+
+
+def chief_print(str):
+
+    if "isChief" in os.environ:
+        
+        if os.environ["isChief"] == "true":
+            print(str)
+    else:
+        print(str)
+
+def _isChief():
+
+	if "isChief" in os.environ:
+
+		if os.environ["isChief"] == "true":
+			return True
+		else:
+			return False	
+	else:
+		return True
 
 
 GCAE_DIR = Path(__file__).resolve().parent
 class Autoencoder(Model):
+	
 
 	def __init__(self, model_architecture, n_markers, noise_std, regularizer):
 		'''
@@ -75,6 +102,8 @@ class Autoencoder(Model):
 		self.noise_std = noise_std
 		self.residuals = dict()
 		self.marker_spec_var = False
+		self.passthrough = 0
+		self.ge = tf.random.Generator.from_seed(1)
 
 		chief_print("\n______________________________ Building model ______________________________")
 		# variable that keeps track of the size of layers in encoder, to be used when constructing decoder.
@@ -84,6 +113,19 @@ class Autoencoder(Model):
 		first_layer_def = model_architecture["layers"][0]
 		layer_module = getattr(eval(first_layer_def["module"]), first_layer_def["class"])
 		layer_args = first_layer_def["args"]
+		for arg in ["n", "size", "layers", "units", "shape", "target_shape", "output_shape", "kernel_size", "strides"]:
+
+				if arg in layer_args.keys():
+					layer_args[arg] = eval(str(layer_args[arg]))
+
+		if "kernel_initializer" in layer_args and layer_args["kernel_initializer"] == "flum":
+			if "kernel_size" in layer_args:
+				dim = layer_args["kernel_size"] * layer_args["filters"]
+			else:
+				dim = layer_args["units"]
+			limit = math.sqrt(2 * 3 / (dim))
+			layer_args["kernel_initializer"] = tf.keras.initializers.RandomUniform(-limit, limit)			
+
 		try:
 			activation = getattr(tf.nn, layer_args["activation"])
 			layer_args.pop("activation")
@@ -98,16 +140,25 @@ class Autoencoder(Model):
 
 		if first_layer_def["class"] == "conv1d" and "strides" in layer_args.keys() and layer_args["strides"] > 1:
 			ns.append(int(first_layer.shape[1]))
+			raise NotImplementedError
 
 		# add all layers except first
 		for layer_def in model_architecture["layers"][1:]:
 			layer_module = getattr(eval(layer_def["module"]), layer_def["class"])
 			layer_args = layer_def["args"]
 
-			for arg in ["size", "layers", "units", "shape", "target_shape", "output_shape", "kernel_size", "strides"]:
+			for arg in ["n", "size", "layers", "units", "shape", "target_shape", "output_shape", "kernel_size", "strides"]:
 
 				if arg in layer_args.keys():
 					layer_args[arg] = eval(str(layer_args[arg]))
+
+			if "kernel_initializer" in layer_args and layer_args["kernel_initializer"] == "flum":
+				if "kernel_size" in layer_args:
+					dim = layer_args["kernel_size"] * layer_args["filters"]
+				else:
+					dim = layer_args["units"]
+				limit = math.sqrt(2 * 3 / (dim))
+				layer_args["kernel_initializer"] = tf.keras.initializers.RandomUniform(-limit, limit)
 
 			if layer_def["class"] == "MaxPool1D":
 				ns.append(int(math.ceil(float(ns[-1]) / layer_args["strides"])))
@@ -137,19 +188,18 @@ class Autoencoder(Model):
 
 		if self.marker_spec_var:
 			random_uniform = tf.random_uniform_initializer()
-			self.ms_variable = tf.Variable(random_uniform(shape = (1, n_markers), dtype=tf.float32), name="marker_spec_var")
-			self.nms_variable = tf.Variable(random_uniform(shape = (1, n_markers), dtype=tf.float32), name="nmarker_spec_var")
+			self.ms_variable = tf.Variable(random_uniform(shape = (1, n_markers), dtype=tf.float32))#, name="marker_spec_var")
+			self.nms_variable = tf.Variable(random_uniform(shape = (1, n_markers), dtype=tf.float32))#, name="nmarker_spec_var")
 		else:
 			chief_print("No marker specific variable.")
-
-
-	def call(self, input_data, is_training = True, verbose = False):
+	
+	def call(self, input_data, targets=None, is_training = True, verbose = False, rander=[False, False], regloss=True):
 		'''
 		The forward pass of the model. Given inputs, calculate the output of the model.
 
 		:param input_data: input data
 		:param is_training: if called during training
-		:param verbose: chief_print the layers and their shapes
+		:param verbose: print the layers and their shapes
 		:return: output of the model (last layer) and latent representation (encoding layer)
 
 		'''
@@ -186,6 +236,7 @@ class Autoencoder(Model):
 
 		# indicator if were doing genetic clustering (ADMIXTURE-style) or not
 		have_encoded_raw = False
+		encoded_data = None
 
 		# do all layers except first
 		for layer_def in self.all_layers[1:]:
@@ -202,7 +253,7 @@ class Autoencoder(Model):
 			if layer_name == "dropout":
 				x = layer_def(x, training = is_training)
 			else:
-				x = layer_def(x)
+				x = layer_def(x, training = is_training)
 
 			# If this is a clustering model then we add noise to the layer first in this step
 			# and the next layer, which is sigmoid, is the actual encoding.
@@ -213,10 +264,39 @@ class Autoencoder(Model):
 				encoded_data_raw = x
 
 			# If this is the encoding layer, we add noise if we are training
-			if layer_name == "encoded":
+			elif "encoded" in layer_name:				
 				if self.noise_std and not have_encoded_raw:
 					x = self.noise_layer(x, training = is_training)
+				###x += 50.
+				encoded_data_pure = x
+				
+				rand_data = self.ge.uniform(tf.shape(x), minval=0., maxval=100.0)
+				#tf.print(tf.shape(x))
+				
+				#TODO The call x[:,i] below in "rander" may result in slicing arrays in a dimension with 0 elements, which can happen in multi gpu training
+				# when the number of gpus is larger than the size of the last batch. This means that the some GPUs may have empty batches. Unsure how to get a nice solution
+
+				#rander = rander + [False] * (len(x[0,:]) - len(rander))
+				#x = tf.stack([rand_data[:,i] if dorand else x[:,i] for i, dorand in enumerate(rander)], axis=1)
+				
+				
+				##x = tf.math.mod(x, 100.)
 				encoded_data = x
+				
+									
+				flipsquare = False
+				if self.regularizer and "flipsquare" in self.regularizer:
+					flipsquare = self.regularizer["flipsquare"]
+				##x = x + tf.where(x < ge.uniform(tf.shape(x), minval=0, maxval=100.0), 100.0, 0.)
+
+				#x = tf.concat((x, y), axis=-1)
+				#, (x*x) * (tf.sign(x) if flipsquare else 1.0), (y*y) * (tf.sign(y) if flipsquare else 1.0)
+				if "basis" in layer_name:
+					basis = tf.expand_dims(tf.range(-200., 200., 20.), axis=0)
+					x = tf.clip_by_value(tf.concat([tf.expand_dims(x[:,i], axis=1) - basis for i in range(2)], axis=1), -40., 40.)
+				x = tf.where(self.passthrough == 1, x, tf.stop_gradient(x))
+
+
 
 			if "Residual" in layer_name:
 				out = self.handle_residual_layer(layer_name, x, verbose=verbose)
@@ -231,20 +311,73 @@ class Autoencoder(Model):
 				x = self.injectms(verbose, x, layer_name, nms_tiled, self.nms_variable)
 
 			if verbose:
-				chief_print("--- shape: {0}".format(x.shape))
+				chief_print("--- shape: {0}".format(x.shape))		
 
-		if self.regularizer:
+		if self.regularizer and regloss and encoded_data is not None:
 			reg_module = eval(self.regularizer["module"])
 			reg_name = getattr(reg_module, self.regularizer["class"])
 			reg_func = reg_name(float(self.regularizer["reg_factor"]))
 
-			# if this is a clustering model then the regularization is added to the raw encoding, not the softmaxed one
-			if have_encoded_raw:
-				reg_loss = reg_func(encoded_data_raw)
-			else:
-				reg_loss = reg_func(encoded_data)
+			# if this is a clustering self then the regularization is added to the raw encoding, not the softmaxed one
+			#if have_encoded_raw:
+			#	reg_loss = reg_func(encoded_data_raw)
+			#else:
+			#	reg_loss = reg_func(encoded_data)
+			reg_loss = self.regularizer["reg_factor"] * tf.reduce_sum(tf.math.maximum(0., tf.square(encoded_data_pure) - 1 * 40000.))
+			#reg_loss += self.regularizer["reg_factor"] * tf.reduce_sum(tf.math.maximum(0., tf.square(x) - 1 * 36.))
 			self.add_loss(reg_loss)
+		if targets is not None and False:
+			reploss = tf.constant(0., tf.float32)
+			for i in range(1, tf.shape(encoded_data)[0] - 1):
+				shifted = tf.stop_gradient(tf.roll(encoded_data, i, axis=0))
+				shifted2 = tf.stop_gradient(tf.roll(encoded_data, i + 1, axis=0))
+				shifted_targets = tf.stop_gradient(tf.roll(targets, i, axis=0))
+				diff = encoded_data - shifted
+				##diff = tf.math.mod(diff, 100.)
+				##diff += tf.where(diff < -50., 100., 0.)
+				##diff += tf.where(diff > 50., -100., 0.)
+				#diff = tf.where(tf.expand_dims(tf.sign(diff[:,0]) >= 0, axis = -1), diff, 0.)
+				mean = tf.math.reduce_mean(encoded_data, axis=0, keepdims=True)
+				#diff *= tf.expand_dims(tf.where(tf.norm(shifted - mean, axis = -1) < tf.norm(encoded_data - mean, axis = -1), 1.0, 0.0), axis=-1)
+				smalleralong = tf.math.reduce_sum(tf.square(encoded_data - mean), axis = -1) < tf.math.reduce_sum((encoded_data - mean) * (shifted - mean), axis = -1)
+				mismatch = tf.math.reduce_mean(tf.where(targets == shifted_targets, 0.0, 1.0), axis=-1)
+				#diff *= tf.expand_dims(tf.where(smalleralong, 0.0, 1.0), axis=-1)
+				#norm = tf.expand_dims(tf.norm(diff, ord = 2, axis = -1), axis=-1)
+				# tf.stop_gradient(diff / (norm + 1e-19)) * 
+				r2 = (tf.norm(diff, ord = self.regularizer["ord"], axis = -1))**tf.cast(self.regularizer["ord"], tf.float32) + self.regularizer["max_rep"]
+				#r2 *= 0.0001
+				##reploss += tf.math.reduce_sum(self.regularizer["rep_factor"] * (mismatch * tf.math.exp(-r2 * 0.2)) - 0.02 * tf.math.exp(-r2*0.5*0.2) - 0.02 * tf.math.exp(-r2*0.05*0.2))
+				#reploss += tf.math.reduce_sum(self.regularizer["rep_factor"] * tf.math.maximum(0., 0.5 - mismatch * -r2))
+				reploss += tf.math.reduce_sum(self.regularizer["rep_factor"] * tf.math.maximum(0., 30. * mismatch - r2))
+				shiftedc = (shifted + shifted2)*0.5
+				##shiftedc = (tf.math.mod(shifted, 100.) + tf.math.mod(shifted2, 100.)) * 0.5
+				
+				shifteddiff = (shifted - shifted2)
+				##shifteddiff = tf.math.mod(shifteddiff, 100.)
+				##shifteddiff += tf.where(shifteddiff < -50., 100., 0.)
+				##shifteddiff += tf.where(shifteddiff > 50., -100., 0.)				
+				if False:
+					shifteddiff = tf.stack((-shifteddiff[:,1], shifteddiff[:,0]), axis=1)
+					seconddiff = encoded_data - shiftedc
+					seconddiff = tf.math.mod(diff, 100.)
+					seconddiff += tf.where(diff < -50., 100., 0.)
+					seconddiff += tf.where(diff > 50., -100., 0.)
+					seconddiff *= shifteddiff
+					seconddiff /= tf.norm(shifteddiff) + 1e-9					
+				else:
+					seconddiff = encoded_data - shiftedc
+					seconddiff -= shifteddiff * tf.math.reduce_sum(seconddiff * shifteddiff, axis=-1, keepdims=True) / (tf.norm(shifteddiff) + 1e-9)**2
+				diff = seconddiff
+				r2 = (tf.norm(diff, ord = self.regularizer["ord"], axis = -1))**tf.cast(self.regularizer["ord"], tf.float32) + self.regularizer["max_rep"]
+				#r2 *= 0.0001
+				#reploss += tf.math.reduce_sum(self.regularizer["rep_factor"] * tf.math.exp(-r2 * 0.2))
 
+
+				#self.add_loss(tf.math.reduce_sum(self.regularizer["rep_factor"] * (tf.math.reduce_mean(tf.where(targets == shifted_targets, 0.0, 1.0), axis=-1) * r2**-6.0 - r2**-3.0)))
+				# tf.norm(diff, ord = 2, axis = -1)
+				# * f.math.l2_normalize(diff, axis = -1)
+			tf.print(reploss)
+			self.add_loss(reploss)
 		return x, encoded_data
 
 
@@ -301,6 +434,7 @@ class Autoencoder(Model):
 
 		return x
 
+
 def get_batches(n_samples, batch_size):
 	n_batches = n_samples // batch_size
 
@@ -320,6 +454,8 @@ def alfreqvector(y_pred):
 	Scales this to (0,1) and interprets this as a allele frequency, uses formula
 	for Hardy-Weinberg equilibrium to get probabilities for genotypes [0,1,2].
 
+	TODO: Currently not current, using logits values in some cases.
+
 	:param y_pred: (n_samples x n_markers) tensor of raw network output for each sample and site
 	:return: (n_samples x n_markers x 3 tensor) of genotype probabilities for each sample and site
 	'''
@@ -328,81 +464,45 @@ def alfreqvector(y_pred):
 		alfreq = tf.keras.activations.sigmoid(y_pred)
 		alfreq = tf.expand_dims(alfreq, -1)
 		return tf.concat(((1-alfreq) ** 2, 2 * alfreq * (1 - alfreq), alfreq ** 2), axis=-1)
+		#return tf.concat(((1-alfreq), alfreq), axis=-1)
 	else:
-		return tf.nn.softmax(y_pred)
+		return y_pred[:,:,0:3]#tf.nn.softmax(y_pred)
+		
+def generatepheno(data, poplist):
+		if data is None:
+			return None
+		return tf.expand_dims(tf.convert_to_tensor([data.get((fam, name), None) for name, fam in poplist]), axis=-1)
 
-def save_ae_weights(epoch, train_directory, autoencoder):
-	weights_file_prefix = train_directory + "/weights/" + str(epoch)
-	startTime = datetime.now()
-	if os.path.isdir(weights_file_prefix):
-		newname = train_directory+"_"+str(time.time())
-		os.rename(train_directory, newname)
-		chief_print("... renamed " + train_directory + " to  " + newname)
+def readpheno(file, num):
+	with open(file, "rt") as f:
+		for _ in f:
+			break
+		return {(line[0], line[1]) : float(line[num + 2]) for line in (full_line.split() for full_line in f)}
 
-	if isChief: autoencoder.save_weights(weights_file_prefix, save_format ="tf")
-	save_time = (datetime.now() - startTime).total_seconds()
-	chief_print("-------- Saving weights: {0} time: {1}".format(weights_file_prefix, save_time))
+def writephenos(file, poplist, phenos):
+	if _isChief():
+		with open(file, "wt") as f:
+			for (name, fam), pheno in zip(poplist, phenos):
+				f.write(f'{fam} {name} {pheno}\n')
+							
 
+def save_weights(train_directory, prefix, model):
+	if model is None:
+		return
 
-def save_ae_weights_multiworker(epoch, train_directory, autoencoder):
+	if _isChief():
+		if os.path.isdir(prefix):
+			newname = train_directory+"_"+str(time.time())
+			os.rename(train_directory, newname)
+			print("... renamed " + train_directory + " to  " + newname)
 
-	if "isChief" in os.environ:
-        
-		if os.environ["isChief"] == "true":
-			weights_file_prefix = train_directory + "/weights/" + str(epoch)
-		else:
-			weights_file_prefix = train_directory + "/weights_temp/"+str(os.environ["SLURMD_NODENAME"]) + str(epoch)
-			
-
-	else:
-		print(str)
-		weights_file_prefix = train_directory + "/weights/" + str(epoch)
-	
-	startTime = datetime.now()
-	if os.path.isdir(weights_file_prefix):
-		newname = train_directory+"_"+str(time.time())
-		os.rename(train_directory, newname)
-		chief_print("... renamed " + train_directory + " to  " + newname)
-
-	autoencoder.save_weights(weights_file_prefix, save_format ="tf")
-
-	save_time = (datetime.now() - startTime).total_seconds()
-	chief_print("-------- Saving weights: {0} time: {1}".format(weights_file_prefix, save_time))
+		model.save_weights(prefix, save_format ="tf")
 
 
 
-
-
-def chief_print(str):
-
-    if "isChief" in os.environ:
-        
-        if os.environ["isChief"] == "true":
-            print(str)
-    else:
-        print(str)
-
-def _isChief():
-
-	if "isChief" in os.environ:
-
-		if os.environ["isChief"] == "true":
-			return True
-		else:
-			return False	
-	else:
-		return True
-
-	
-	 
-
-if __name__ == "__main__":
-	timer = time.perf_counter()
+def main():
 	chief_print("tensorflow version {0}".format(tf.__version__))
 	tf.keras.backend.set_floatx('float32')
-	tf.random.set_seed(2)
-	np.random.seed(2)
-
 
 	try:
 		arguments = docopt(__doc__, version='GenoAE 1.0')
@@ -414,15 +514,14 @@ if __name__ == "__main__":
 		knew = k.split('--')[-1]
 		arg=arguments.pop(k)
 		arguments[knew]=arg
-	
-	
+
 	if "SLURMD_NODENAME" in os.environ:
 
 		slurm_job = 1
 		addresses, chief, num_workers = set_tf_config()
 		isChief = os.environ["SLURMD_NODENAME"] == chief
 		os.environ["isChief"] = json.dumps(str(isChief))
-		print(num_workers)
+		chief_print(num_workers)
 		if num_workers > 1 and arguments["train"]:
 			#Here, NCCL is what I would want to use - it is Nvidias own implementation of reducing over the devices. However, this induces a segmentation fault, and the default value works.
 			# had some issues, I think this was resolved by updating to TensorFlow 2.7 from 2.5. 
@@ -436,9 +535,9 @@ if __name__ == "__main__":
 
 			num_physical_gpus = len(tf.config.list_physical_devices(device_type='GPU'))
 			
-			print(tf.config.list_physical_devices(device_type='GPU'))
+			chief_print(tf.config.list_physical_devices(device_type='GPU'))
 			gpus = ["gpu:"+ str(i) for i in range(num_physical_gpus)]
-			print(gpus)
+			chief_print(gpus)
 			
 		#elif num_workers > 1 and (arguments["evaluate"] or arguments["project"]):
 		else:
@@ -448,9 +547,9 @@ if __name__ == "__main__":
 
 			num_physical_gpus = len(tf.config.list_physical_devices(device_type='GPU'))
 			
-			print(tf.config.list_physical_devices(device_type='GPU'))
+			chief_print(tf.config.list_physical_devices(device_type='GPU'))
 			gpus = ["gpu:"+ str(i) for i in range(num_physical_gpus)]
-			print(gpus)
+			chief_print(gpus)
 			strategy =  tf.distribute.MirroredStrategy(devices = gpus, cross_device_ops=tf.distribute.NcclAllReduce())
 			
 			slurm_job = 0
@@ -461,12 +560,35 @@ if __name__ == "__main__":
 		slurm_job = 0
 		strategy =  tf.distribute.MirroredStrategy()
 	
+	
+	@tf.function
+	def project_batch(autoencoder, loss_func, input_train_batch, targets_train_batch, pheno_model):
+		decoded_train_batch, encoded_train_batch = autoencoder(input_train_batch, is_training = True)
+		if pheno_model is not None:
+			add = pheno_model(encoded_train_batch)[0][:,0]
+			print(add)
+			print(np.shape(add))
+			if pheno_train is not None:
+				pheno_train = np.concatenate((pheno_train, add), axis=0)
+			else:
+				pheno_train = add
+			
+		loss_train_batch = loss_func(y_pred = decoded_train_batch, y_true = targets_train_batch)
+		#loss_train_batch += sum(autoencoder.losses)
+		return decoded_train_batch, encoded_train_batch, loss_train_batch
+
+
+	@tf.function
+	def init_model(autoencoder, input_test):
+		return autoencoder(input_test[0:2], is_training = False, verbose = True)
+
 	chief_print("slurm_job" + str(slurm_job))
 	print(isChief)
 
 	num_devices = strategy.num_replicas_in_sync
 	chief_print('Number of devices: {}'.format(num_devices))
 	
+
 
 	if arguments["trainedmodeldir"]:
 		trainedmodeldir = arguments["trainedmodeldir"]
@@ -488,16 +610,20 @@ if __name__ == "__main__":
 		trainedmodelname = arguments["trainedmodelname"]
 		train_directory = trainedmodeldir + trainedmodelname
 
-		data_opts_id = trainedmodelname.split(".")[3]
-		train_opts_id = trainedmodelname.split(".")[2]
-		model_id = trainedmodelname.split(".")[1]
-		data = trainedmodelname.split(".")[4]
+		split = trainedmodelname.split(".")
 
+		data_opts_id = split[3]
+		train_opts_id = split[2]
+		model_id = split[1]
+		data = split[4]
+		pheno_model_id = (split + [None])[5]
 	else:
 		data = arguments['data']
 		data_opts_id = arguments["data_opts_id"]
 		train_opts_id = arguments["train_opts_id"]
 		model_id = arguments["model_id"]
+		pheno_model_id = arguments.get("pheno_model_id")
+
 		train_directory = False
 
 	with open("{}/data_opts/{}.json".format(GCAE_DIR, data_opts_id)) as data_opts_def_file:
@@ -508,6 +634,12 @@ if __name__ == "__main__":
 
 	with open("{}/models/{}.json".format(GCAE_DIR, model_id)) as model_def_file:
 		model_architecture = json.load(model_def_file)
+
+	if pheno_model_id is not None:
+		with open(f"{GCAE_DIR}/models/{pheno_model_id}.json") as model_def_file:
+			pheno_model_architecture = json.load(model_def_file)
+	else:
+		pheno_model_architecture = None
 
 	for layer_def in model_architecture["layers"]:
 		if "args" in layer_def.keys() and "name" in layer_def["args"].keys() and "encoded" in layer_def["args"]["name"] and "units" in layer_def["args"].keys():
@@ -531,9 +663,7 @@ if __name__ == "__main__":
 	chief_print("______________________________")
 
 
-	batch_size = train_opts["batch_size"]# * num_devices
-	
-
+	batch_size = train_opts["batch_size"]
 	learning_rate = train_opts["learning_rate"]
 	regularizer = train_opts["regularizer"]
 
@@ -555,7 +685,6 @@ if __name__ == "__main__":
 		sparsify_input = False
 		missing_mask_input = False
 		n_input_channels = 1
-		sparsifies = False
 
 	if "impute_missing" in data_opts.keys():
 		fill_missing = data_opts["impute_missing"]
@@ -571,7 +700,8 @@ if __name__ == "__main__":
 		n_input_channels = 2
 
 	if not train_directory:
-		train_directory = trainedmodeldir + "ae." + model_id + "." + train_opts_id + "." + data_opts_id  + "." + data
+		dirparts = [model_id, train_opts_id, data_opts_id, data] + ([pheno_model_id] if pheno_model_id is not None else [])
+		train_directory = trainedmodeldir + "ae." + ".".join(dirparts)
 
 	if arguments["pdata"]:
 		pdata = arguments["pdata"]
@@ -580,42 +710,55 @@ if __name__ == "__main__":
 
 	data_prefix = datadir + pdata
 	results_directory = "{0}/{1}".format(train_directory, pdata)
+	try:
+		os.mkdir(results_directory)
+	except OSError:
+		pass
 
-	if not os.path.exists(train_directory):
-		if isChief:
-			#os.mkdir(trainedmodeldir)
-			os.mkdir(train_directory)
-	#if not os.path.exists(results_directory):
-		#if isChief:
-			os.mkdir(results_directory)
-		
-	
 	encoded_data_file = "{0}/{1}/{2}".format(train_directory, pdata, "encoded_data.h5")
 
 	if "noise_std" in train_opts.keys():
 		noise_std = train_opts["noise_std"]
 	else:
 		noise_std = False
-	def get_originally_nonmissing_mask(genos):
-		'''
-		Get a boolean mask representing missing values in the data.
-		Missing value is represented by float(norm_opts["missing_val"]).
 
-		Uses the presence of missing_val in the true genotypes as indicator, missing_val should not be set to
-		something that can exist in the data set after normalization!!!!
+	if (arguments['evaluate'] or arguments['animate'] or arguments['plot']):
 
-		:param genos: (n_samples x n_markers) genotypes
-		:return: boolean mask of the same shape as genos
-		'''
-		orig_nonmissing_mask = tf.not_equal(genos, float(norm_opts["missing_val"]))
+		if os.path.isfile(encoded_data_file):
+			encoded_data = h5py.File(encoded_data_file, 'r')
+		else:
+			print("------------------------------------------------------------------------")
+			print("Error: File {0} not found.".format(encoded_data_file))
+			print("------------------------------------------------------------------------")
+			exit(1)
 
-		return orig_nonmissing_mask
+		epochs = get_projected_epochs(encoded_data_file)
+
+		if arguments['epoch']:
+			epoch = int(arguments['epoch'])
+			if epoch in epochs:
+				epochs = [epoch]
+			else:
+				print("------------------------------------------------------------------------")
+				print("Error: Epoch {0} not found in {1}.".format(epoch, encoded_data_file))
+				print("------------------------------------------------------------------------")
+				exit(1)
+
+		if doing_clustering:
+			if arguments['animate']:
+				print("------------------------------------------------------------------------")
+				print("Error: Animate not supported for genetic clustering model.")
+				print("------------------------------------------------------------------------")
+				exit(1)
 
 
-	if (arguments['train'] or arguments['project']):
+			if arguments['plot'] and not superpopulations_file:
+				print("------------------------------------------------------------------------")
+				print("Error: Plotting of genetic clustering results requires a superpopulations file.")
+				print("------------------------------------------------------------------------")
+				exit(1)
 
-		# Create parquet file from the plink files if it does not already exist, and create an instance of the dataset. 
-		# The number of SNP markers are needed in the loss function definitions
+	else:
 		max_mem_size = 5 * 10**10 # this is approx 50GB
 		filebase = data_prefix
 		parquet_converter(filebase, max_mem_size=max_mem_size)
@@ -626,7 +769,11 @@ if __name__ == "__main__":
 						impute_missing = fill_missing)
 
 		n_markers = data.n_markers
-		
+		if pheno_model_architecture is not None:
+			phenodata = readpheno(data_prefix + ".phe", 2)
+		else:
+			phenodata = None
+
 
 		loss_def = train_opts["loss"]
 		loss_class = getattr(eval(loss_def["module"]), loss_def["class"])
@@ -636,105 +783,328 @@ if __name__ == "__main__":
 			loss_args = dict()
 		loss_obj = loss_class(**loss_args)
 
+		def get_originally_nonmissing_mask(genos):
+			'''
+			Get a boolean mask representing missing values in the data.
+			Missing value is represented by float(norm_opts["missing_val"]).
+
+			Uses the presence of missing_val in the true genotypes as indicator, missing_val should not be set to
+			something that can exist in the data set after normalization!!!!
+
+			:param genos: (n_samples x n_markers) genotypes
+			:return: boolean mask of the same shape as genos
+			'''
+			orig_nonmissing_mask = tf.not_equal(genos, float(norm_opts["missing_val"]))
+
+			return orig_nonmissing_mask
+
 		with strategy.scope():
+			if loss_class == tf.keras.losses.CategoricalCrossentropy or loss_class == tf.keras.losses.KLDivergence or True:
 
-			if loss_class == tf.keras.losses.CategoricalCrossentropy or loss_class == tf.keras.losses.KLDivergence:
-				
+				def loss_func(y_pred, y_true, pow=1., avg=False):
+					y_pred = y_pred[:, 0:n_markers]
+					#y_pred = alfreqvector(y_pred)
+					#y_true = tf.one_hot(tf.cast(y_true * 2, tf.uint8), 3)
+					#y1 = y_true[:, :, 0] + 0.5 * y_true[:, :, 1]
+					#y_true = tf.stack((y1, 1.0 - y1), axis = -1)
+
+
+
+					#if not fill_missing:
+					#	orig_nonmissing_mask = get_originally_nonmissing_mask(y_true)
+					#else:
+					#	orig_nonmissing_mask = np.full(y_true.shape, True)
+					# TODO: Reintroduce missingness support here, with proper shape after slicing!
+
+					y_trueorig = y_true
+					y_pred = alfreqvector(y_pred)
+					y_true = tf.one_hot(tf.cast(y_true * 2, tf.uint8), 3) * 0.9997 + 0.0001
+					y_true2 = y_true#*0.997 + 0.001
+					if avg:
+						y_true = y_true * -1./tf.cast(tf.shape(y_true)[0], tf.float32) + tf.math.reduce_mean(y_true, axis=0, keepdims=True)
+
+					#tf.print("YPRED", y_pred)
+					#tf.print("YTRUE", y_true)
+					#tf.print("YMASK", orig_nonmissing_mask)
+					#tf.print("YMASK", tf.math.zero_fraction(orig_nonmissing_mask))
+					#tf.print("PRED", y_pred[orig_nonmissing_mask,:])
+					#tf.print("TRUE", y_true[orig_nonmissing_mask,:])
+					#return -tf.math.reduce_mean(tf.math.reduce_sum(tf.math.log(y_pred+1e-30) * y_true, axis = 0) / ((tf.math.reduce_sum(y_true2, axis=0))))
+					beta = 0.999
+																		
+					###return -tf.math.reduce_mean(tf.math.reduce_sum(tf.math.log(y_pred+1e-30) * y_true, axis = 0) * (1.0 - beta) / (1-tf.math.pow(beta, tf.math.reduce_sum(y_true2, axis=0)+1)+1e-9))
+					#return -tf.math.reduce_mean(tf.math.reduce_sum(      (tf.clip_by_value(y_pred,-10,10)-tf.math.reduce_max(y_pred, axis=-1, keepdims=True)) * y_true, axis = 0) * (1.0 - beta) / (1-tf.math.pow(beta, tf.math.reduce_sum(y_true2, axis=0)+1)+1e-9))
+					y_pred *= pow
+					y_pred = y_pred - tf.stop_gradient(tf.math.reduce_max(y_pred, axis=-1, keepdims=True))
+					y_pred_prob = tf.nn.softmax(y_pred)
+					gamma = 1
+					#partialres = (tf.math.reduce_sum(      (y_pred-tf.math.log(tf.math.reduce_sum(tf.math.exp(y_pred), axis=-1, keepdims=True))) * y_true * (1 - tf.math.reduce_sum(tf.stop_gradient(y_pred_prob) * y_true, axis=-1, keepdims=True)/tf.math.reduce_sum(y_true * y_true, axis=-1, keepdims=True))**gamma, axis = 0) * (1.0 - beta) / (1-tf.math.pow(beta, tf.math.reduce_sum(y_true2, axis=0)+1)+1e-9))
+					partialres = - (tf.math.reduce_sum(      (y_pred-tf.math.log(tf.math.reduce_sum(tf.math.exp(y_pred), axis=-1, keepdims=True))) * y_true * (1 - tf.math.reduce_sum(tf.stop_gradient(y_pred_prob) * y_true, axis=-1, keepdims=True)/tf.math.reduce_sum(y_true * y_true, axis=-1, keepdims=True))**gamma, axis = 0) * tf.math.pow(beta, tf.math.reduce_sum(y_true2, axis=0)-1))
+					##partialres = (tf.math.reduce_sum(      (y_pred-tf.math.log(tf.math.reduce_sum(tf.math.exp(y_pred), axis=-1, keepdims=True))) * y_true, axis = 0) * (1.0 - beta) / (1-tf.math.pow(beta, tf.math.reduce_sum(y_true2, axis=0)+1)+1e-9))
+
+					##return -tf.math.reduce_mean(tf.boolean_mask(partialres, ge.uniform(tf.shape(partialres)) < 0.9))
+					return tf.math.reduce_mean(partialres)
+					#return tf.nn.compute_average_loss(partialres, global_batch_size=batch_size) 
+					#return 0.5 * loss_obj(y_pred = y_pred, y_true = y_true) + 0.5 * loss_obj(y_pred = tf.math.reduce_mean(y_pred, axis = 0, keepdims = True), y_true = tf.math.reduce_mean(y_true, axis = 0, keepdims = True))
+
+
+
+
+
+
+			else:
 				def loss_func(y_pred, y_true):
+
 					y_pred = y_pred[:, 0:n_markers]
+					y_true = tf.convert_to_tensor(y_true)
 
 					if not fill_missing:
 						orig_nonmissing_mask = get_originally_nonmissing_mask(y_true)
-
-					y_pred = alfreqvector(y_pred)
-					y_true = tf.one_hot(tf.cast(y_true * 2, tf.uint8), 3)*0.9997 + 0.0001
-					
-					if not fill_missing:
-						y_pred = y_pred[orig_nonmissing_mask]
-						y_true = y_true[orig_nonmissing_mask]
-
-					if loss_class ==	tf.keras.losses.CategoricalCrossentropy:
-						loss_obj = tf.keras.losses.CategoricalCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
-
-					if loss_class == loss_class == tf.keras.losses.KLDivergence:
-						loss_obj = tf.keras.losses.KLDivergence(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
-
-					per_example_loss = loss_obj(y_true, y_pred)
-					per_example_loss /= n_markers
-					loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size=batch_size
-														) 
-
-					return loss
-				def loss_func_non_dist(y_pred, y_true):
-					y_pred = y_pred[:, 0:n_markers]
-
-					if not fill_missing:
-						orig_nonmissing_mask = get_originally_nonmissing_mask(y_true)
-
-					y_pred = alfreqvector(y_pred)
-					y_true = tf.one_hot(tf.cast(y_true * 2, tf.uint8), 3)*0.9997 + 0.0001
-
-					if not fill_missing:
 						y_pred = y_pred[orig_nonmissing_mask]
 						y_true = y_true[orig_nonmissing_mask]
 
 					return loss_obj(y_pred = y_pred, y_true = y_true)
-
-			else:
-
-				def loss_func(y_pred, y_true):
-					y_pred = y_pred[:, 0:n_markers]
-
-					if not fill_missing:
-						orig_nonmissing_mask = get_originally_nonmissing_mask(y_true)
-						y_pred = y_pred[orig_nonmissing_mask]
-						y_true = y_true[orig_nonmissing_mask]
-
-					if loss_class == tf.keras.losses.MeanSquaredError:
-						loss_obj = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE) 
-					per_example_loss = loss_obj(y_true = y_true, y_pred = y_pred)			
-
-					loss = tf.nn.compute_average_loss(per_example_loss, global_batch_size= batch_size) 
-					return loss
-						
+			
+			
 			@tf.function
-			def train_step(model, optimizer, loss_function, input, targets):
+			def distributed_train_step(model, model2, optimizer, optimizer2, loss_function, input, targets, pure, phenomodel=None, phenotargets=None):
 				
-				with tf.GradientTape() as tape:
-					output, _ = model(input)
-					loss_value = loss_function(y_pred = output, y_true = targets)
-					loss_value += tf.nn.scale_regularization_loss(sum(model.losses))	
-					
-				grads = tape.gradient(loss_value, model.trainable_variables)
-				optimizer.apply_gradients(zip(grads, model.trainable_variables),experimental_aggregate_gradients=False )
+				per_replica_losses = strategy.run(run_optimization, args=(model, model2, optimizer, optimizer2, loss_function, input, targets, pure, phenomodel, phenotargets))
+				loss = strategy.reduce("SUM", per_replica_losses, axis=None)
 
-				return loss_value  
+				return loss 
+		
+			@tf.function
+			def valid_batch(autoencoder, loss_func, input_valid_batch, targets_valid_batch):
+				output_valid_batch, encoded_data_valid_batch = autoencoder(input_valid_batch, is_training = True, regloss=False)					 
 
+				valid_loss_batch = loss_func(y_pred = output_valid_batch, y_true = targets_valid_batch)
+				#valid_loss_batch += sum(autoencoder.losses)
+				return valid_loss_batch
 
 			@tf.function
-			def distributed_train_step(model, optimizer, loss_function, input, targets):
-
-				per_replica_losses = strategy.run(train_step, args=(model, optimizer, loss_function, input, targets))
+			def distributed_valid_batch(autoencoder, loss_func, input_valid_batch, targets_valid_batch):
+				
+				per_replica_losses = strategy.run(run_optimization, args=(autoencoder, loss_func, input_valid_batch, targets_valid_batch))
 				loss = strategy.reduce("SUM", per_replica_losses, axis=None)
 
 				return loss 
 
+
 			@tf.function
-			def compute_loss(model, loss_function, input, targets):
-					output, _ = model(input, is_training = False)
-					loss_value = loss_function(y_pred = output, y_true = targets)
+			def run_optimization(model, model2, optimizer, optimizer2, loss_function, input, targets, pure, phenomodel=None, phenotargets=None):
+				'''
+				Run one step of optimization process based on the given data.
+
+				:param model: a tf.keras.Model
+				:param optimizer: a tf.keras.optimizers
+				:param loss_function: a loss function
+				:param input: input data
+				:param targets: target data
+				:return: value of the loss function
+				'''
+				val = model.ge.uniform((), minval=0, maxval=1.0)
+				#full_loss = val < 0.5
+				full_loss = True
+				do_two = False
+				do_softmaxed = False
+				with tf.GradientTape() as g:
+					output, encoded_data = model(input, targets, is_training=True, regloss=False)
+					if pure and phenomodel is not None:
+						z = phenomodel(encoded_data, is_training=True)
+						loss_value = tf.reduce_sum(z[0])
+					if pure or full_loss:
+						loss_value = loss_function(y_pred = output, y_true = targets)
+						if do_two:
+							output2, _ = model2(input, targets, is_training=True, regloss=False)
+							loss_value += loss_function(y_pred = output2, y_true = targets)
+						
+					#else:			
+						
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "AD_066", tf.math.reduce_sum(tf.square(encoded_data), axis=-1), 0.))
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "Zapo0097", tf.square(encoded_data[:, 1]) + tf.square(tf.minimum(0.0, encoded_data[:, 0] - 1.0)), 0.))
 					
-					loss_value += tf.nn.scale_regularization_loss(sum(model.losses))	
-					return loss_value
+				allvars = model.trainable_variables + (model2.trainable_variables if model2 is not None else []) + (phenomodel.trainable_variables if phenomodel is not None else [])
+				#print("ALLVARS", allvars, "###")
+				gradients = g.gradient(loss_value, allvars)
 
-			@tf.function
-			def dist_compute_loss(model, loss_function, input, targets):
-			
-				per_replica_losses = strategy.run(compute_loss, args=(model, loss_function, input, targets))
-				loss = strategy.reduce("SUM", per_replica_losses, axis=None)
-				return loss
+				orig_loss = loss_value
+
+				with tf.GradientTape() as g5:
+					loss_value = tf.constant(0.)
+					if do_softmaxed:
+						for output, encoded_data in (model(input, targets, is_training=True, regloss=False),) + ((model2(input, targets, is_training=True, regloss=False), ) if do_two else ()):
+							y_true = tf.one_hot(tf.cast(targets * 2, tf.uint8), 3)
+							y_pred = tf.nn.softmax(output[:,0:model.n_markers])
+							#0*tf.math.reduce_mean(y_pred,axis=0,keepdims=True)
+							loss_value += tf.math.reduce_sum(((-y_pred) * y_true)) * 1e-6
+					for val in allvars:
+						maxflax = tf.math.reduce_max(tf.math.abs(val))
+						maxflax2 = tf.math.minimum(tf.math.reduce_max(tf.math.abs(val)), tf.math.reduce_max(tf.math.abs(1. - tf.math.abs(val))))
+						#tf.print("MAX", maxflax)
+						loss_value += tf.square(tf.math.maximum(1.0, maxflax2))
+					#if pure or full_loss:
+					#	loss_value = -loss_function(y_pred = output, y_true = targets, avg=True)
+						
+					#else:			
+						
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "AD_066", tf.math.reduce_sum(tf.square(encoded_data), axis=-1), 0.))
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "Zapo0097", tf.square(encoded_data[:, 1]) + tf.square(tf.minimum(0.0, encoded_data[:, 0] - 1.0)), 0.))
+					
+				gradientsavg = g5.gradient(loss_value, allvars)
+				other_loss4 = loss_value
+				#other_loss4 = 0
+
+				#with tf.GradientTape() as g4:
+				#	output, encoded_data = model(input, targets, is_training=True, rander=[False, True])
+				#	if pure or full_loss:
+				#		loss_value = loss_function(y_pred = output, y_true = targets)
+						
+					#else:			
+						
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "AD_066", tf.math.reduce_sum(tf.square(encoded_data), axis=-1), 0.))
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "Zapo0097", tf.square(encoded_data[:, 1]) + tf.square(tf.minimum(0.0, encoded_data[:, 0] - 1.0)), 0.))
+					
+				#gradientsrandx = g4.gradient(loss_value, model.trainable_variables)
+				#other_loss3 = loss_value
+				#with tf.GradientTape() as g4:
+				#	output, encoded_data = model(input, targets, is_training=True)
+				#	if pure or full_loss:
+				#		loss_value = loss_function(y_pred = output, y_true = targets, pow=2.)
+						
+					#else:			
+						
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "AD_066", tf.math.reduce_sum(tf.square(encoded_data), axis=-1), 0.))
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "Zapo0097", tf.square(encoded_data[:, 1]) + tf.square(tf.minimum(0.0, encoded_data[:, 0] - 1.0)), 0.))
+					
+				#gradientssq = g4.gradient(loss_value, model.trainable_variables)
+				#other_loss3 = loss_value
+
+				with tf.GradientTape() as g4:
+					output, encoded_data = model(input, targets, is_training=True)
+					
+					#loss_value = tf.math.reduce_sum(tf.reduce_sum(tf.square(encoded_data-encoded_data2),axis=-1))*1e-2
+					#loss_value = loss_function(y_pred = output, y_true = targets) * (1.0 if pure or full_loss else 0.0)
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "AD_066", tf.math.reduce_sum(tf.square(encoded_data), axis=-1), 0.))
+					#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "Zapo0097", tf.square(encoded_data[:, 1]) + tf.square(tf.minimum(0.0, encoded_data[:, 0] - 1.0)), 0.))
+					loss_value = sum(model.losses)
+					if do_two:
+						output2, encoded_data2 = model2(input, targets, is_training=True)
+						loss_value += sum(model2.losses)
+				gradientsc = g4.gradient(loss_value, allvars)
+				other_loss2 = loss_value
+
+				if do_two:
+					factor = 0.
+					with tf.GradientTape() as g2:
+						output, encoded_data = model(input, targets, is_training=True, regloss=False)
+						output2, encoded_data2 = model2(input, targets, is_training=True, regloss=False)
+						loss_value = tf.math.reduce_sum( -tf.math.log(0.5+0.5*tf.reduce_sum((factor*encoded_data-tf.roll(encoded_data, 1, axis=0))
+						* (factor*encoded_data2-tf.roll(encoded_data2, 1, axis=0)), axis=-1)
+						* tf.math.rsqrt
+						(tf.reduce_sum((factor*encoded_data-tf.roll(encoded_data, 1, axis=0)) * (factor*encoded_data-tf.roll(encoded_data, 1, axis=0)), axis=-1) * tf.reduce_sum(
+						(factor*encoded_data2-tf.roll(encoded_data2, 1, axis=0)) * (factor*encoded_data2-tf.roll(encoded_data2, 1, axis=0))+1e-4, axis=-1))))*1e-2
+					gradients2 = g2.gradient(loss_value, allvars)
+					other_loss = loss_value
+
+					with tf.GradientTape() as g3:
+						output, encoded_data = model(input, targets, is_training=True, regloss=False)
+						output2, encoded_data2 = model2(input, targets, is_training=True, regloss=False)
+						loss_value = tf.math.reduce_sum( -tf.math.log(1.-0.5*tf.reduce_sum((factor*encoded_data-tf.roll(encoded_data, 1, axis=0))
+						* (factor*encoded_data2-tf.roll(encoded_data2, 2, axis=0)), axis=-1)
+						* tf.math.rsqrt
+						(tf.reduce_sum((factor*encoded_data-tf.roll(encoded_data, 1, axis=0)) * (factor*encoded_data-tf.roll(encoded_data, 1, axis=0)), axis=-1) * tf.reduce_sum( 
+						(factor*encoded_data2-tf.roll(encoded_data2, 2, axis=0)) * (factor*encoded_data2-tf.roll(encoded_data2, 2, axis=0))+1e-4, axis=-1))))*1e-2
+					##	output, encoded_data = model(input, targets, is_training=True)
+					##	#loss_value = loss_function(y_pred = output, y_true = targets) * (1.0 if pure or full_loss else 0.0)
+						#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "AD_066", tf.math.reduce_sum(tf.square(encoded_data), axis=-1), 0.))
+						#loss_value += 1e-3*tf.reduce_sum(tf.where(poplist[:, 0] == "Zapo0097", tf.square(encoded_data[:, 1]) + tf.square(tf.minimum(0.0, encoded_data[:, 0] - 1.0)), 0.))
+					##	y_pred = output - tf.stop_gradient(tf.math.reduce_max(output, axis=-1, keepdims=True))
+					##	loss_value = -tf.math.reduce_mean(tf.square(y_pred - tf.roll(y_pred, 1, axis = 0)) * 1e-3)
+					gradientsb = g3.gradient(loss_value, allvars)
+					other_loss3 = loss_value
+
+				if phenomodel is not None:
+					with tf.GradientTape() as g6:
+						loss_value = tf.constant(0.)
+						for output, encoded_data in (model(input, targets, is_training=True, regloss=False),) + ((model2(input, targets, is_training=True, regloss=False), ) if do_two else ()):
+							phenopred, _ = phenomodel(encoded_data, is_training=True)
+							tf.print("PRED")
+							tf.print(phenopred)
+							tf.print(phenotargets)
+							loss_value += tf.math.reduce_sum(tf.square(phenopred - phenotargets)) * 1e-2
+
+					gradientspheno = g6.gradient(loss_value, allvars)
+					phenoloss = loss_value
+				
+				
+				loss_value = orig_loss
+				##radients3 = []
+
+				##loss_value += orig_loss
+
+				##for g1, g2 in zip(gradients, gradients2):
+				##	if g1 is None:
+				##		g3 = g2
+				##	elif g2 is None:
+				##		g3 = g1
+				##	else:
+				##		#g3 = tf.where(tf.math.sign(g1 * g2) >= 0, g1 + g2, 0.)
+				##		summed = g1 + g2
+				##		g3 = tf.where(tf.math.sign(g1 * g2) >= 0, summed, tf.math.sign(summed) * tf.math.minimum(0.5 * tf.math.minimum(tf.abs(g1), tf.abs(g2)), tf.abs(summed)))
+				##	gradients3.append(g3)
+				def combine(gradients, gradients2):
+					alphanom = tf.constant(0.)
+					alphadenom = tf.constant(1.0e-30)
+					for g1, g2 in zip(gradients, gradients2):
+						if g1 is not None and g2 is not None:
+							gdiff = g2 - g1
+							alphanom += tf.math.reduce_sum(gdiff * g2)
+							alphadenom += tf.math.reduce_sum(gdiff * gdiff)
+					alpha = alphanom / alphadenom
+					gradients3 = []
+					cappedalpha = tf.clip_by_value(alpha, 0., 1.)
+					for g1, g2 in zip(gradients, gradients2):
+						if g1 is None:
+							gradients3.append(g2)
+						elif g2 is None:
+							gradients3.append(g1)
+						else:
+							gradients3.append(g1 * (1-cappedalpha) + g2 * (cappedalpha))
+					return (gradients3, alpha)
+
+				#gradients4, alpha4 = combine(gradientsrandx, gradientsrandy)
+				#alpha4 = 0
+				gradients3, alpha4 = combine(gradients, gradientsavg)
+				alpha3 = 0
+				#gradients4 = gradientsrandx
+				if do_two:
+					gradients4, alpha3 = combine(gradients2, gradientsb)
+					gradients3, alpha = combine(gradients3, gradients4)
+				else:
+					alpha3 = 0
+					alpha = 0
+					other_loss3 = 0
+					other_loss = 0
+				
+				gradients3, alpha2 = combine(gradients3, gradientsc)
+				if phenomodel is not None:
+					gradients3, phenoalpha = combine(gradients3, gradientspheno)
+				else:
+					phenoloss, phenoalpha = (0.,0.)
+				if pure or full_loss:
+					optimizer.apply_gradients(zip(gradients3, allvars))
+				#if pure or not full_loss:
+				#	# was optimizer2
+				#	optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+				#tf.print(loss_value, other_loss4, other_loss3, other_loss2, other_loss, full_loss, alpha4, alpha3, alpha2, alpha)
+				#tf.print(loss_value, other_loss4, other_loss3, other_loss2, other_loss, phenoloss, full_loss, alpha4, alpha3, alpha2, alpha, phenoalpha)
+				return loss_value
 
 
+		
+	if arguments['train']:
+		
 		try:
 			resume_from = int(arguments["resume_from"])
 			if resume_from < 1:
@@ -744,12 +1114,10 @@ if __name__ == "__main__":
 			resume_from = False
 
 
-	if arguments['train']:
+
+		
 		epochs = int(arguments["epochs"])
 		save_interval = int(arguments["save_interval"])
-
-
-
 
 		data = alt_data_generator(filebase= data_prefix, 
 						batch_size = batch_size,
@@ -827,28 +1195,36 @@ if __name__ == "__main__":
 		with strategy.scope():
 			# Initialize the model and optimizer
 			autoencoder = Autoencoder(model_architecture, n_markers, noise_std, regularizer)
+			autoencoder2 = Autoencoder(model_architecture, n_markers, noise_std, regularizer)
+			#phenotargets_init = generatepheno(phenodata, poplist)
+
 			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
+			optimizer2 = tf.optimizers.Adam(learning_rate = lr_schedule)
+			if pheno_model_architecture is not None:
+				pheno_model = Autoencoder(pheno_model_architecture, 2, noise_std, regularizer)
+			else:
+				pheno_model = None
 
+			batch_dist_input, batch_dist_target, _ = next(ds.as_numpy_iterator())
+			output_test, encoded_alt_data_generator = autoencoder(batch_dist_input, is_training = False, verbose = True)
 
-			#batch_dist_input, batch_dist_target, _ = next(ds.as_numpy_iterator())
-			#output_test, encoded_alt_data_generator = autoencoder(batch_dist_input, is_training = False, verbose = True)
-
-			if resume_from:
-				chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
-				weights_file_prefix = "{0}/{1}/{2}".format(train_directory, "weights", resume_from)
-				chief_print("Reading weights from {0}".format(weights_file_prefix))
-				# get a single BATCH to run through optimization to reload weights and optimizer variables
-				# This initializes the variables used by the optimizers,
-				# as well as any stateful metric variables
-				distributed_train_step(autoencoder, optimizer, loss_func, batch_dist_input, batch_dist_target)
-				autoencoder.load_weights(weights_file_prefix)
+		if resume_from:
+			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
+			weights_file_prefix = "{0}/{1}/{2}".format(train_directory, "weights", resume_from)
+			chief_print("Reading weights from {0}".format(weights_file_prefix))
+			# get a single BATCH to run through optimization to reload weights and optimizer variables
+			# This initializes the variables used by the optimizers,
+			# as well as any stateful metric variables
+			distributed_train_step(autoencoder, optimizer, loss_func, batch_dist_input, batch_dist_target)
+			autoencoder.load_weights(weights_file_prefix)
 
 
 
 		
 		######### Create objects for tensorboard summary ###############################
-		train_writer = tf.summary.create_file_writer(train_directory + '/train')
-		valid_writer = tf.summary.create_file_writer(train_directory + '/valid')
+		if isChief:
+			train_writer = tf.summary.create_file_writer(train_directory + '/train')
+			valid_writer = tf.summary.create_file_writer(train_directory + '/valid')
 		######################################################
 
 		# train losses per epoch
@@ -859,22 +1235,25 @@ if __name__ == "__main__":
 		""""
 		Enable the below command to log the runs in the profiler, also de-comment the line after the training loop. 
 
-		 Used for debugging the code / profiling different runs. Visualized in TensorBoard. I like to use ThinLinc to look at it, seems like the
-		 least effort solution to get tensorboard up and running. Possible to do it in other ways, but more painful
+		Used for debugging the code / profiling different runs. Visualized in TensorBoard. I like to use ThinLinc to look at it, seems like the
+		least effort solution to get tensorboard up and running. Possible to do it in other ways, but more painful
 		"""
 		suffix = ""
-		if slurm_job:
-			suffix = str(os.environ["SLURMD_NODENAME"])
-		logs = train_directory+ "/logdir/"  + datetime.now().strftime("%Y%m%d-%H%M%S") + suffix
+		#if slurm_job:
+		#	suffix = str(os.environ["SLURMD_NODENAME"])
+		#logs = train_directory+ "/logdir/"  + datetime.now().strftime("%Y%m%d-%H%M%S") + suffix
 		
 		profile = 0 
-
+	
 		for e in range(1,epochs+1):
-				if e ==2:
 
-					if profile : tf.profiler.experimental.start(logs)
+				if e % 100 < 50:
+					autoencoder.passthrough.assign(0)
+				else:
+					autoencoder.passthrough.assign(1)
+				#if e ==2:
 
-				train_losses = []
+					#if profile : tf.profiler.experimental.start(logs)
 				startTime = datetime.now()
 				effective_epoch = e + resume_from
 				losses_t_batches = []
@@ -882,17 +1261,23 @@ if __name__ == "__main__":
 				train_batch_loss = 0
 
 				t0 = time.perf_counter()
-				for batch_dist_input, batch_dist_target, _  in dds:
-					train_batch_loss += distributed_train_step(autoencoder, optimizer, loss_func, batch_dist_input, batch_dist_target)
+				for batch_dist_input, batch_dist_target, poplist  in dds:
+					bi = batch_dist_input
+					bt = batch_dist_target
+					pt = generatepheno(phenodata, poplist)
+
+					train_batch_loss += distributed_train_step(autoencoder, autoencoder2, optimizer, optimizer2, loss_func, bi, bt, False, phenomodel=pheno_model, phenotargets=pt)
 			
-				train_loss_this_epoch = train_batch_loss /n_train_samples  
+				train_loss_this_epoch = np.average(train_batch_loss)   /n_train_batches  
 		
-				with train_writer.as_default():
-					tf.summary.scalar('loss', train_loss_this_epoch, step = step_counter)
-					if lr_schedule:
-						tf.summary.scalar("learning_rate", optimizer._decayed_lr(var_dtype=tf.float32), step = step_counter)
-					else:
-						tf.summary.scalar("learning_rate", learning_rate, step = step_counter)
+
+				if isChief:
+					with train_writer.as_default():
+						tf.summary.scalar('loss', train_loss_this_epoch, step = step_counter)
+						if lr_schedule:
+							tf.summary.scalar("learning_rate", optimizer._decayed_lr(var_dtype=tf.float32), step = step_counter)
+						else:
+							tf.summary.scalar("learning_rate", learning_rate, step = step_counter)
 
 				train_time = (datetime.now() - startTime).total_seconds()
 				train_times.append(train_time)
@@ -909,21 +1294,28 @@ if __name__ == "__main__":
 					valid_loss_batch = 0
 
 					for input_valid_batch, targets_valid_batch, _  in dds_validation:
-						valid_loss_batch += dist_compute_loss(autoencoder, loss_func, input_valid_batch, targets_valid_batch)
+						valid_loss_batch += distributed_valid_batch(autoencoder, loss_func, input_valid_batch, targets_valid_batch)
 
-					valid_loss_this_epoch = valid_loss_batch /n_valid_samples 
+					valid_loss_this_epoch = valid_loss_batch /n_valid_batches
 
-					with valid_writer.as_default():
-						tf.summary.scalar('loss', valid_loss_this_epoch, step=step_counter)
+					if isChief:
+						with valid_writer.as_default():
+							tf.summary.scalar('loss', valid_loss_this_epoch, step=step_counter)
 
 					losses_v.append(valid_loss_this_epoch)
 					valid_time = (datetime.now() - startTime).total_seconds()
 					chief_print("--- Valid loss: {:.4f}  time: {}".format(valid_loss_this_epoch, valid_time))
 
-				if e % save_interval == 0:
-					save_ae_weights_multiworker(effective_epoch, train_directory, autoencoder)
-
-		if profile: tf.profiler.experimental.stop()
+				if isChief:
+					weights_file_prefix = train_directory + "/weights/" + str(effective_epoch)
+					pheno_weights_file_prefix = train_directory + "/pheno_weights/" + str(effective_epoch)
+					if e % save_interval == 0:
+						startTime = datetime.now()
+						save_weights(train_directory, weights_file_prefix, autoencoder)
+						save_weights(train_directory, pheno_weights_file_prefix, pheno_model)
+						save_time = (datetime.now() - startTime).total_seconds()
+						save_epochs.append(effective_epoch)
+						print("-------- Save time: {0} dir: {1}".format(save_time, weights_file_prefix))
 
 		if isChief:
 			outfilename = train_directory + "/" + "train_times.csv"
@@ -950,24 +1342,14 @@ if __name__ == "__main__":
 			plt.savefig("{}/losses_from_train.pdf".format(train_directory))
 			plt.close()
 
-			chief_print("Done training. Wrote to {0}".format(train_directory))
-			chief_print("TOTAL TRAINING TIME : " + str( time.perf_counter() - timer))
+		chief_print("Done training. Wrote to {0}".format(train_directory))
 
 
-	
+
 	if arguments['project']: 
 		
 
-		try:
-			if autoencoder in locals:
-				del autoencoder
-		except: 
-			pass
-		try:
-			if data in locals:
-				del data
-		except: 
-			pass
+	
 		
 		projected_epochs = get_projected_epochs(encoded_data_file)
 		
@@ -991,7 +1373,6 @@ if __name__ == "__main__":
 		batch_size_project = batch_size 
 		sparsify_fraction = 0.0
 
-	
 
 		data.sparsifies = [sparsify_fraction]
 
@@ -1008,11 +1389,11 @@ if __name__ == "__main__":
 		#####################
 
 		n_train_samples = copy.deepcopy(data.n_train_samples)
-		print("n_train_samples: " + str(n_train_samples))
+		chief_print("n_train_samples: " + str(n_train_samples))
 
 		n_train_batches, n_train_samples_last_batch = get_batches(n_train_samples, batch_size_project)
 		n_valid_samples = 0
-		print("n_train_samples_last_batch: " + str(n_train_samples_last_batch))
+		chief_print("n_train_samples_last_batch: " + str(n_train_samples_last_batch))
 		batch_size_valid = 1
 		n_valid_batches, n_valid_samples_last_batch = get_batches(n_valid_samples, batch_size_valid)
 
@@ -1031,6 +1412,15 @@ if __name__ == "__main__":
 		genotype_concordance_metric = GenotypeConcordance()
 
 		autoencoder = Autoencoder(model_architecture, n_markers, noise_std, regularizer)
+		if pheno_model_architecture is not None:
+			pheno_model = Autoencoder(pheno_model_architecture, 2, noise_std, regularizer)
+		else:
+			pheno_model = None
+
+		optimizer = tf.optimizers.Adam(learning_rate = learning_rate)#, clipvalue=1.0)
+		optimizer2 = tf.optimizers.Adam(learning_rate = learning_rate)#, clipvalue=1.0)
+
+		genotype_concordance_metric = GenotypeConcordance()
 
 		scatter_points_per_epoch = []
 		colors_per_epoch = []
@@ -1054,6 +1444,9 @@ if __name__ == "__main__":
 			chief_print("Reading weights from {0}".format(weights_file_prefix))
 
 			autoencoder.load_weights(weights_file_prefix)
+			if pheno_model is not None:
+				pheno_weights_file_prefix = "{0}/{1}/{2}".format(train_directory, "pheno_weights", epoch)
+				pheno_model.load_weights(pheno_weights_file_prefix)
 
 
 			ind_pop_list_train = np.empty((0,2))
@@ -1068,8 +1461,8 @@ if __name__ == "__main__":
 			for input_train_batch, targets_train_batch, ind_pop_list_train_batch in ds:
 
 				decoded_train_batch, encoded_train_batch  = autoencoder(input_train_batch, is_training = False)
-				loss_train_batch = loss_func_non_dist(y_pred = decoded_train_batch, y_true = targets_train_batch)
-				loss_train_batch += sum((autoencoder.losses))
+				loss_train_batch = loss_func(y_pred = decoded_train_batch, y_true = targets_train_batch)
+				#loss_train_batch += sum((autoencoder.losses))
 
 				encoded_train = np.concatenate((encoded_train, encoded_train_batch), axis=0)
 
@@ -1086,7 +1479,8 @@ if __name__ == "__main__":
 			ind_pop_list_train = np.array(ind_pop_list_train)
 			encoded_train = np.array(encoded_train)
 
-			
+			list(ind_pop_list_train[:,1])
+			list(ind_pop_list_train_reference[:,1])
 			loss_value = np.sum(loss_value_per_train_batch)  / n_train_samples  
 
 			if epoch == epochs[0]:
@@ -1158,12 +1552,10 @@ if __name__ == "__main__":
 				except:
 					plot_coords(encoded_train, "{0}/dimred_e_{1}".format(results_directory, epoch))
 
-
-		
+			if pheno_train is not None:
+				writephenos(f'{results_directory}/{epoch}.phe', ind_pop_list_train, pheno_train)
 			write_h5(encoded_data_file, "{0}_encoded_train".format(epoch), encoded_train)
 
-
-	
 		try:
 			plot_genotype_hist(np.array(genotypes_output), "{0}/{1}_e{2}".format(results_directory, "output_as_genotypes", epoch))
 			plot_genotype_hist(np.array(true_genotypes), "{0}/{1}".format(results_directory, "true_genotypes"))
@@ -1177,14 +1569,15 @@ if __name__ == "__main__":
 
 
 		plt.plot(epochs_combined, losses_train_combined,
-				label="all data",
-				c="red")
+				 label="all data",
+				 c="red")
 
 		plt.xlabel("Epoch")
 		plt.ylabel("Loss function value")
 		plt.legend()
 		plt.savefig(results_directory + "/" + "losses_from_project.pdf")
 		plt.close()
+
 
 		############################### gconc ###############################
 		try:
@@ -1253,9 +1646,11 @@ if __name__ == "__main__":
 				chief_print("------------------------------------------------------------------------")
 				exit(1)
 
+
 	if arguments['animate']:
 
-		chief_print("Animating epochs {}".format(epochs))
+		print("Animating epochs {}".format(epochs))
+
 		FFMpegWriter = animation.writers['ffmpeg']
 		scatter_points_per_epoch = []
 		colors_per_epoch = []
@@ -1265,7 +1660,8 @@ if __name__ == "__main__":
 		ind_pop_list_train = read_h5(encoded_data_file, "ind_pop_list_train")
 
 		for epoch in epochs:
-			chief_print("########################### epoch {0} ###########################".format(epoch))
+			print("########################### epoch {0} ###########################".format(epoch))
+
 			encoded_train = read_h5(encoded_data_file, "{0}_encoded_train".format(epoch))
 
 			coords_by_pop = get_coords_by_pop(data_prefix, encoded_train, ind_pop_list = ind_pop_list_train)
@@ -1290,9 +1686,9 @@ if __name__ == "__main__":
 
 		make_animation(epochs, scatter_points_per_epoch, colors_per_epoch, markers_per_epoch, edgecolors_per_epoch, "{0}/{1}{2}".format(results_directory, "dimred_animation", suffix))
 
-	if arguments['evaluate'] :# and isChief: 
+	if arguments['evaluate']:
 
-		chief_print("Evaluating epochs {}".format(epochs))
+		print("Evaluating epochs {}".format(epochs))
 
 		# all metrics assumed to have a single value per epoch
 		metric_names = arguments['metrics'].split(",")
@@ -1311,7 +1707,7 @@ if __name__ == "__main__":
 				pass
 
 		for epoch in epochs:
-			chief_print("########################### epoch {0} ###########################".format(epoch))
+			print("########################### epoch {0} ###########################".format(epoch))
 
 			encoded_train = read_h5(encoded_data_file, "{0}_encoded_train".format(epoch))
 
@@ -1342,7 +1738,7 @@ if __name__ == "__main__":
 					else:
 						min_points_required = n_latent_dim + 2
 					hull_error = convex_hull_error(coords_by_pop, plot=False, min_points_required= min_points_required)
-					chief_print("------ hull error : {}".format(hull_error))
+					print("------ hull error : {}".format(hull_error))
 
 					metrics[m].append(hull_error)
 
@@ -1366,7 +1762,7 @@ if __name__ == "__main__":
 
 
 					f1_score_avg, f1_score_per_pop = f1_score_kNN(encoded_train, pop_list, pops_to_use, k = k)
-					chief_print("------ f1 score with {0}NN :{1}".format(k, f1_score_avg))
+					print("------ f1 score with {0}NN :{1}".format(k, f1_score_avg))
 					metrics[m].append(f1_score_avg)
 					assert len(f1_score_per_pop) == len(pops_to_use)
 					f1_scores_by_pop["avg"][this_f1_score_index] =  "{:.4f}".format(f1_score_avg)
@@ -1382,9 +1778,9 @@ if __name__ == "__main__":
 						f1_scores_by_pop[pops_to_use[p]][this_f1_score_index] =  "{:.4f}".format(f1_score_per_pop[p])
 
 				else:
-					chief_print("------------------------------------------------------------------------")
-					chief_print("Error: Metric {0} is not implemented.".format(m))
-					chief_print("------------------------------------------------------------------------")
+					print("------------------------------------------------------------------------")
+					print("Error: Metric {0} is not implemented.".format(m))
+					print("------------------------------------------------------------------------")
 
 			write_f1_scores_to_csv(results_directory, "epoch_{0}".format(epoch), superpopulations_file, f1_scores_by_pop, coords_by_pop)
 
@@ -1393,8 +1789,7 @@ if __name__ == "__main__":
 			plt.plot(epochs, metrics[m], label="train", c="orange")
 			plt.xlabel("Epoch")
 			plt.ylabel(m)
-
-			if isChief: plt.savefig("{0}/{1}.pdf".format(results_directory, m))
+			plt.savefig("{0}/{1}.pdf".format(results_directory, m))
 			plt.close()
 
 			outfilename = "{0}/{1}.csv".format(results_directory, m)
@@ -1402,12 +1797,10 @@ if __name__ == "__main__":
 				res_writer = csv.writer(res_file, delimiter=',')
 				res_writer.writerow(epochs)
 				res_writer.writerow(metrics[m])
-	elif arguments['evaluate']  and not isChief: 
-		print("Work has ended for this worker, now relying only on the Chief :)")
-		exit(1)	
+
 	if arguments['plot']:
 
-		chief_print("Plotting epochs {}".format(epochs))
+		print("Plotting epochs {}".format(epochs))
 
 		ind_pop_list_train = read_h5(encoded_data_file, "ind_pop_list_train")
 		pop_list = []
@@ -1419,7 +1812,7 @@ if __name__ == "__main__":
 				pass
 
 		for epoch in epochs:
-			chief_print("########################### epoch {0} ###########################".format(epoch))
+			print("########################### epoch {0} ###########################".format(epoch))
 
 			encoded_train = read_h5(encoded_data_file, "{0}_encoded_train".format(epoch))
 
@@ -1442,8 +1835,6 @@ if __name__ == "__main__":
 					plot_coords(encoded_train, "{0}/dimred_e_{1}".format(results_directory, epoch))
 
 
-	chief_print("TOTAL TIME : " + str( time.perf_counter() - timer))
-
-	# This removes the saved weights. They take up waaaay too much space on disk for many large models / long runs.
-	# After having projected/evaluated, we really dont need them anymore, unless we want to continue training after a checkpoint.
-	# Not sure if that is something I will want to do in the near future however.
+if __name__ == "__main__":
+	#with mirrored_strategy.scope():
+	main()

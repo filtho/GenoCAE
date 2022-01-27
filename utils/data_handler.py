@@ -1094,7 +1094,7 @@ class alt_data_generator(data_generator_ae):
 
 	def __init__(self, filebase,
 		 		 batch_size, normalization_mode = "genotypewise01",
-		  		normalization_options ={"flip": False, "missing_val":-1.0}, impute_missing = True, sparsifies = False ):
+		  		normalization_options ={"flip": False, "missing_val":-1.0, "num_markers":None}, impute_missing = True, sparsifies = False ):
 
 		self.filebase = filebase 
 		self.batch_size = batch_size
@@ -1106,6 +1106,9 @@ class alt_data_generator(data_generator_ae):
 		self.missing_val = normalization_options["missing_val"]
 
 		self.marker_count() # This sets the number of markers
+		#if normalization_options["num_markers"] is not None:
+		self.n_markers = normalization_options["num_markers"]
+		print(self.n_markers)
 
 		if  sparsifies == False:
 			self.sparsify_input = False
@@ -1167,6 +1170,7 @@ class alt_data_generator(data_generator_ae):
 			# this read is made to be as large as possible, consisting of several batches, but (perhaps not the entire dataset)
 
 			df_numpy = pd.DataFrame.to_numpy(df)
+			df_numpy = df_numpy[0:self.n_markers, : ]
 
 			batches_per_chunk = np.ceil(len(chunk_indices) / self.batch_size)
 			# Set nan values to 9. 
@@ -1256,8 +1260,9 @@ class alt_data_generator(data_generator_ae):
 			# Not 100% straight forward how to get the same 'rolling sparsification' that the sparsify fraction uses the next value for the next batch.
 			# Here I am just choosing one of the fractions at random. Should have essentially the same effect if I am not missing anything.
 			# Makes it hard to compare the runs for the original code vs my alteration. 
-			sparsify_fraction = self.sparsifies[np.random.choice(len(self.sparsifies))]
-
+			#sparsify_fraction = self.sparsifies[np.random.choice(len(self.sparsifies))]
+			sparsify_fraction = tf.random.shuffle(self.sparsifies)[0]
+			#sparsify_fraction = self.sparsifies[tf.random.uniform(shape=(1,), minval = 0, maxval = len(self.sparsifies), dtype=tf.int32 )]
 		else:
 			sparsify_fraction = 0.0
 		try:
@@ -1267,24 +1272,46 @@ class alt_data_generator(data_generator_ae):
 			pass
 
 		missing_value = self.missing_val
-		keep_fraction = 1.0 - sparsify_fraction
 
 		if last_batch:
 			if self.training:
-				mask = np.full(shape=(self.n_train_samples_last_batch, self.n_markers), fill_value=1.0,
-								dtype=np.float32)
-				mask[np.random.random_sample((self.n_train_samples_last_batch, self.n_markers)) > keep_fraction] = 0.0
+				mask = tf.experimental.numpy.full(shape=(self.n_train_samples_last_batch, self.n_markers), fill_value=1.0,
+								dtype=tf.float32)
+				b = tf.random.uniform(shape = (self.n_train_samples_last_batch, self.n_markers),minval = 0, maxval = 1)
+
+				indices = tf.where(b<sparsify_fraction)
+								
+				b = tf.sparse.SparseTensor(indices=indices,
+														values=(tf.repeat(-1.0, tf.shape(indices)[0])),
+														dense_shape= (self.n_train_samples_last_batch, self.n_markers))
+				mask = tf.sparse.add(mask,b)
+			
 			else:
-				mask = np.full(shape=(self.n_valid_samples_last_batch, self.n_markers), fill_value=1.0,
-								dtype=np.float32)
-				mask[np.random.random_sample((self.n_valid_samples_last_batch, self.n_markers)) > keep_fraction] = 0.0
+			
+				mask = tf.experimental.numpy.full(shape=(self.n_valid_samples_last_batch, self.n_markers), fill_value=1.0,
+								dtype=tf.float32)
+				b = tf.random.uniform(shape = (self.n_valid_samples_last_batch, self.n_markers),minval = 0, maxval = 1)
+
+				indices = tf.where(b<sparsify_fraction)
+								
+				b = tf.sparse.SparseTensor(indices=indices,
+														values=(tf.repeat(-1.0, tf.shape(indices)[0])),
+														dense_shape= (self.n_valid_samples_last_batch, self.n_markers))
+				mask = tf.sparse.add(mask,b)
+
 		else:
-			mask = np.full(shape=(self.batch_size, self.n_markers), fill_value=1.0, dtype=np.float32)
-			mask[np.random.random_sample((self.batch_size, self.n_markers)) > keep_fraction] = 0.0
-
-
+		
+			mask = tf.experimental.numpy.full(shape=(self.batch_size, self.n_markers), fill_value=1.0,
+							dtype=tf.float32)
+			b = tf.random.uniform(shape = (self.batch_size, self.n_markers),minval = 0, maxval = 1)
+			indices = tf.where(b<sparsify_fraction)			
+			b = tf.sparse.SparseTensor(indices=indices,
+													values=(tf.repeat(-1.0, tf.shape(indices)[0])),
+													dense_shape= (self.batch_size, self.n_markers))
+			mask = tf.sparse.add(mask,b)
+		
 		sparsified_data = tf.math.add(tf.math.multiply(x, mask), -1 * missing_value * (mask - 1))
-
+		tf.print(tf.executing_eagerly())
 		input_data_train = tf.stack([sparsified_data, mask], axis=-1)
 
 		if self.missing_mask_input:
@@ -1294,8 +1321,6 @@ class alt_data_generator(data_generator_ae):
 			# Just extract everything but the last dimension, which contains the mask.
 			return input_data_train[:, :, 0], x, inds
 
-
-	
 	def marker_count(self):
 		"""
 		Just a funtion to count the number of markers.
@@ -1438,9 +1463,6 @@ def parquet_converter(filebase, max_mem_size):
 
 	# step 5, delete any temp files
 	shutil.rmtree("Data_temp")
-
-
-
 
 
 
