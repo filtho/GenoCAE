@@ -54,6 +54,25 @@ from utils.set_tf_config_berzelius import set_tf_config
 from utils.data_handler import alt_data_generator
 
 
+def chief_print(str):
+	if "isChief" in os.environ:
+
+		if os.environ["isChief"] == "true":
+			print(str)
+	else:
+		print(str)
+
+
+def _isChief():
+	if "isChief" in os.environ:
+
+		if os.environ["isChief"] == "true":
+			return True
+		else:
+			return False
+	else:
+		return True
+
 
 GCAE_DIR = Path(__file__).resolve().parent
 class Autoencoder(Model):
@@ -149,7 +168,7 @@ class Autoencoder(Model):
 
 		:param input_data: input data
 		:param is_training: if called during training
-		:param verbose: chief_print the layers and their shapes
+		:param verbose: print the layers and their shapes
 		:return: output of the model (last layer) and latent representation (encoding layer)
 
 		'''
@@ -373,27 +392,6 @@ def save_ae_weights_multiworker(epoch, train_directory, autoencoder):
 
 
 
-def chief_print(str):
-
-    if "isChief" in os.environ:
-        
-        if os.environ["isChief"] == "true":
-            print(str)
-    else:
-        print(str)
-
-def _isChief():
-
-	if "isChief" in os.environ:
-
-		if os.environ["isChief"] == "true":
-			return True
-		else:
-			return False	
-	else:
-		return True
-
-	
 	 
 
 if __name__ == "__main__":
@@ -460,7 +458,7 @@ if __name__ == "__main__":
 		
 		slurm_job = 0
 		strategy =  tf.distribute.MirroredStrategy()
-	
+		isChief = True
 	chief_print("slurm_job" + str(slurm_job))
 	print(isChief)
 
@@ -581,13 +579,13 @@ if __name__ == "__main__":
 	data_prefix = datadir + pdata
 	results_directory = "{0}/{1}".format(train_directory, pdata)
 
-	if not os.path.exists(train_directory):
-		if isChief:
+	#if not os.path.exists(train_directory):
+	#		if isChief:
 			#os.mkdir(trainedmodeldir)
-			os.mkdir(train_directory)
+		#	os.mkdir(train_directory)
 	#if not os.path.exists(results_directory):
 		#if isChief:
-			os.mkdir(results_directory)
+	#			os.mkdir(results_directory)
 		
 	
 	encoded_data_file = "{0}/{1}/{2}".format(train_directory, pdata, "encoded_data.h5")
