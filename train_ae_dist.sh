@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=gcae_dist    # job name
-#SBATCH --nodes=2               # Change this
+#SBATCH --nodes=1               # Change this
 #SBATCH --ntasks-per-node=1     # Don't change this
-#SBATCH --gres=gpu:1            # Change this
+#SBATCH --gres=gpu:2            # Change this
 #SBATCH --time=71:00:00         # job length
 #SBATCH --cpus-per-task=8       # Change this, use 8 cpu cores per GPU (the quoted default by NSC. C)
 #SBATCH --mem=125G              # Change this, NSC default is \approx 125 per GPU

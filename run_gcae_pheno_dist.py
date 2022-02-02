@@ -752,7 +752,7 @@ def main():
 	else:
 		max_mem_size = 5 * 10**10 # this is approx 50GB
 		filebase = data_prefix
-		parquet_converter(filebase, max_mem_size=max_mem_size)
+		if isChief: parquet_converter(filebase, max_mem_size=max_mem_size)
 		data = alt_data_generator(filebase= data_prefix, 
 						batch_size = batch_size,
 						normalization_mode = norm_mode,
