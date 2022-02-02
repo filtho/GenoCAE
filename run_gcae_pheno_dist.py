@@ -45,20 +45,14 @@ import csv
 import copy
 import h5py
 import matplotlib.animation as animation
-import asyncio
 from pathlib import Path
 from utils.data_handler import alt_data_generator, parquet_converter
 from utils.set_tf_config_berzelius import set_tf_config
 
-#gpus = tf.config.experimental.list_physical_devices('GPU')
-#tf.config.experimental.set_virtual_device_configuration(gpus[0], [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=28000)])
 
-#mirrored_strategy = tf.distribute.MirroredStrategy()
-#tf.debugging.enable_check_numerics()
-
-
-
-
+tf.config.experimental.enable_tensor_float_32_execution(
+    False
+)
 
 def chief_print(str):
 
@@ -102,7 +96,8 @@ class Autoencoder(Model):
 		self.noise_std = noise_std
 		self.residuals = dict()
 		self.marker_spec_var = False
-		self.passthrough = 0
+		self.passthrough = tf.Variable(1.0, dtype=tf.float32, trainable=False)
+
 		self.ge = tf.random.Generator.from_seed(1)
 
 		chief_print("\n______________________________ Building model ______________________________")
@@ -270,16 +265,12 @@ class Autoencoder(Model):
 				###x += 50.
 				encoded_data_pure = x
 				
-				rand_data = self.ge.uniform(tf.shape(x), minval=0., maxval=100.0)
-				#tf.print(tf.shape(x))
-				
+				#rand_data = self.ge.uniform(tf.shape(x), minval=0., maxval=100.0)
 				#TODO The call x[:,i] below in "rander" may result in slicing arrays in a dimension with 0 elements, which can happen in multi gpu training
 				# when the number of gpus is larger than the size of the last batch. This means that the some GPUs may have empty batches. Unsure how to get a nice solution
 
 				#rander = rander + [False] * (len(x[0,:]) - len(rander))
 				#x = tf.stack([rand_data[:,i] if dorand else x[:,i] for i, dorand in enumerate(rander)], axis=1)
-				
-				
 				##x = tf.math.mod(x, 100.)
 				encoded_data = x
 				
@@ -294,7 +285,7 @@ class Autoencoder(Model):
 				if "basis" in layer_name:
 					basis = tf.expand_dims(tf.range(-200., 200., 20.), axis=0)
 					x = tf.clip_by_value(tf.concat([tf.expand_dims(x[:,i], axis=1) - basis for i in range(2)], axis=1), -40., 40.)
-				x = tf.where(self.passthrough == 1, x, tf.stop_gradient(x))
+				x = tf.where(self.passthrough == 1.0, x, tf.stop_gradient(x))
 
 
 
@@ -539,7 +530,7 @@ def main():
 			gpus = ["gpu:"+ str(i) for i in range(num_physical_gpus)]
 			chief_print(gpus)
 			
-		#elif num_workers > 1 and (arguments["evaluate"] or arguments["project"]):
+		
 		else:
 			if not isChief:
 				print("Work has ended for this worker, now relying only on the Chief :)")
@@ -663,7 +654,7 @@ def main():
 	chief_print("______________________________")
 
 
-	batch_size = train_opts["batch_size"]
+	batch_size = train_opts["batch_size"] # * num_devices
 	learning_rate = train_opts["learning_rate"]
 	regularizer = train_opts["regularizer"]
 
@@ -885,7 +876,7 @@ def main():
 			@tf.function
 			def distributed_valid_batch(autoencoder, loss_func, input_valid_batch, targets_valid_batch):
 				
-				per_replica_losses = strategy.run(run_optimization, args=(autoencoder, loss_func, input_valid_batch, targets_valid_batch))
+				per_replica_losses = strategy.run(valid_batch, args=(autoencoder, loss_func, input_valid_batch, targets_valid_batch))
 				loss = strategy.reduce("SUM", per_replica_losses, axis=None)
 
 				return loss 
@@ -903,7 +894,7 @@ def main():
 				:param targets: target data
 				:return: value of the loss function
 				'''
-				val = model.ge.uniform((), minval=0, maxval=1.0)
+				#val = model.ge.uniform((), minval=0, maxval=1.0)
 				#full_loss = val < 0.5
 				full_loss = True
 				do_two = False
@@ -1127,7 +1118,7 @@ def main():
 						sparsifies  = sparsifies)
 
 		n_markers = data.n_markers
-		data.define_validation_set2(validation_split= 0.2)
+		data.define_validation_set2(validation_split= validation_split)
 
 		data.missing_mask_input = missing_mask_input
 
@@ -1192,35 +1183,36 @@ def main():
 		ds_validation = data.create_dataset(chunk_size, "validation")
 		dds_validation = strategy.experimental_distribute_dataset(ds_validation)
 
+		
 		with strategy.scope():
-			# Initialize the model and optimizer
-			autoencoder = Autoencoder(model_architecture, n_markers, noise_std, regularizer)
-			autoencoder2 = Autoencoder(model_architecture, n_markers, noise_std, regularizer)
-			#phenotargets_init = generatepheno(phenodata, poplist)
+				# Initialize the model and optimizer
+				
 
-			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule)
-			optimizer2 = tf.optimizers.Adam(learning_rate = lr_schedule)
+			autoencoder = Autoencoder(model_architecture, n_markers, noise_std, regularizer)
+			autoencoder2 = None #  Autoencoder(model_architecture, n_markers, noise_std, regularizer)
+			
 			if pheno_model_architecture is not None:
 				pheno_model = Autoencoder(pheno_model_architecture, 2, noise_std, regularizer)
 			else:
 				pheno_model = None
-
-			batch_dist_input, batch_dist_target, _ = next(ds.as_numpy_iterator())
-			output_test, encoded_alt_data_generator = autoencoder(batch_dist_input, is_training = False, verbose = True)
-
+			optimizer = tf.optimizers.Adam(learning_rate = lr_schedule, beta_1=0.99, beta_2 = 0.999)
+			optimizer2 = tf.optimizers.Adam(learning_rate = lr_schedule, beta_1=0.99, beta_2 = 0.999)
+			
+			input_test, targets_test, _ = next(ds.as_numpy_iterator())
+			#input_test2 = np.zeros(shape = (2,n_markers,2))
+			output_test, encoded_alt_data_generator = autoencoder(input_test[0:2,:,:], is_training = False, verbose = True)
+		
 		if resume_from:
 			chief_print("\n______________________________ Resuming training from epoch {0} ______________________________".format(resume_from))
 			weights_file_prefix = "{0}/{1}/{2}".format(train_directory, "weights", resume_from)
 			chief_print("Reading weights from {0}".format(weights_file_prefix))
-			# get a single BATCH to run through optimization to reload weights and optimizer variables
-			# This initializes the variables used by the optimizers,
-			# as well as any stateful metric variables
-			distributed_train_step(autoencoder, optimizer, loss_func, batch_dist_input, batch_dist_target)
 			autoencoder.load_weights(weights_file_prefix)
 
 
-
+			input_test, targets_test, _ = next(ds.as_numpy_iterator())
 		
+			output_test, encoded_alt_data_generator = autoencoder(input_test[0:2,:,:], is_training = False, verbose = True)
+
 		######### Create objects for tensorboard summary ###############################
 		if isChief:
 			train_writer = tf.summary.create_file_writer(train_directory + '/train')
@@ -1248,9 +1240,9 @@ def main():
 		for e in range(1,epochs+1):
 
 				if e % 100 < 50:
-					autoencoder.passthrough.assign(0)
+					autoencoder.passthrough.assign(0.0)
 				else:
-					autoencoder.passthrough.assign(1)
+					autoencoder.passthrough.assign(1.0)
 				#if e ==2:
 
 					#if profile : tf.profiler.experimental.start(logs)
@@ -1261,14 +1253,20 @@ def main():
 				train_batch_loss = 0
 
 				t0 = time.perf_counter()
+				count_ = 0
 				for batch_dist_input, batch_dist_target, poplist  in dds:
 					bi = batch_dist_input
 					bt = batch_dist_target
 					pt = generatepheno(phenodata, poplist)
+					#tf.print(tf.config.experimental.tensor_float_32_execution_enabled())
+
 
 					train_batch_loss += distributed_train_step(autoencoder, autoencoder2, optimizer, optimizer2, loss_func, bi, bt, False, phenomodel=pheno_model, phenotargets=pt)
-			
-				train_loss_this_epoch = np.average(train_batch_loss)   /n_train_batches  
+
+
+
+					count_+=1
+				train_loss_this_epoch = train_batch_loss   /n_train_batches #/ num_devices  
 		
 
 				if isChief:
@@ -1294,9 +1292,10 @@ def main():
 					valid_loss_batch = 0
 
 					for input_valid_batch, targets_valid_batch, _  in dds_validation:
+						
 						valid_loss_batch += distributed_valid_batch(autoencoder, loss_func, input_valid_batch, targets_valid_batch)
 
-					valid_loss_this_epoch = valid_loss_batch /n_valid_batches
+					valid_loss_this_epoch = valid_loss_batch /n_valid_batches #/ num_devices
 
 					if isChief:
 						with valid_writer.as_default():
@@ -1346,7 +1345,7 @@ def main():
 
 
 
-	if arguments['project']: 
+	if arguments['project'] and isChief: 
 		
 
 	
@@ -1370,7 +1369,7 @@ def main():
 		chief_print("Already projected: {0}".format(projected_epochs))
 
 		# Make this larger. For some reason a low project batch size resulted in division by zero in the normalization, which yields a bad scaler
-		batch_size_project = batch_size 
+		batch_size_project = batch_size
 		sparsify_fraction = 0.0
 
 
@@ -1416,6 +1415,7 @@ def main():
 			pheno_model = Autoencoder(pheno_model_architecture, 2, noise_std, regularizer)
 		else:
 			pheno_model = None
+			pheno_train = None
 
 		optimizer = tf.optimizers.Adam(learning_rate = learning_rate)#, clipvalue=1.0)
 		optimizer2 = tf.optimizers.Adam(learning_rate = learning_rate)#, clipvalue=1.0)
@@ -1429,7 +1429,7 @@ def main():
 
 		data.batch_size = batch_size_project 
 		chunk_size = 5  * data.batch_size
-		
+		pheno_train = None
 		# HERE WE NEED TO "NOT SHUFFLE" THE DATASET, IN ORDER TO GET EVALUATE TO WORK AS INTENDED (otherwise, there is a problem with the ordering, works on its own, 
 		# but works differently when directly compared to original implementation) 
 		ds = data.create_dataset(chunk_size, "training", shuffle = False)
@@ -1481,7 +1481,7 @@ def main():
 
 			list(ind_pop_list_train[:,1])
 			list(ind_pop_list_train_reference[:,1])
-			loss_value = np.sum(loss_value_per_train_batch)  / n_train_samples  
+			loss_value = np.sum(loss_value_per_train_batch)  / n_train_samples # /num_devices 
 
 			if epoch == epochs[0]:
 				assert len(ind_pop_list_train) == data.n_train_samples, "{0} vs {1}".format(len(ind_pop_list_train), data.n_train_samples)
@@ -1836,5 +1836,4 @@ def main():
 
 
 if __name__ == "__main__":
-	#with mirrored_strategy.scope():
 	main()
