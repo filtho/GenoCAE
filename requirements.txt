@@ -10,3 +10,5 @@ scipy==1.4.1
 numba
 pandas==1.0.4
 pandas-plink==2.0.4
+pyarrow
+pysnptools

@@ -1338,6 +1338,7 @@ class alt_data_generator(data_generator_ae):
 			mask = tf.sparse.add(mask,b)
 		
 		sparsified_data = tf.math.add(tf.math.multiply(x, mask), -1 * missing_value * (mask - 1))
+		#tf.print(tf.executing_eagerly())
 		input_data_train = tf.stack([sparsified_data, mask], axis=-1)
 
 		if self.missing_mask_input:
